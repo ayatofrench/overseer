@@ -362,4 +362,23 @@ mod tests {
         let result: Result<LearningId, _> = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse();
         assert!(matches!(result, Err(IdParseError::MissingPrefix { .. })));
     }
+
+    #[test]
+    fn review_id_new() {
+        let id = ReviewId::new();
+        assert!(id.as_str().starts_with("rev_"));
+        assert_eq!(id.ulid_part().len(), 26);
+    }
+
+    #[test]
+    fn review_id_parse_with_prefix() {
+        let id: ReviewId = "rev_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        assert_eq!(id.as_str(), "rev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
+
+    #[test]
+    fn review_id_parse_without_prefix_fails() {
+        let result: Result<ReviewId, _> = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse();
+        assert!(matches!(result, Err(IdParseError::MissingPrefix { .. })));
+    }
 }

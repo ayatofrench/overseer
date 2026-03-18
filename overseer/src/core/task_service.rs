@@ -2723,4 +2723,296 @@ mod tests {
             result
         );
     }
+
+    // =========================================================================
+    // REVIEW TESTS
+    // =========================================================================
+
+    /// Helper: create an in-progress task for review tests
+    fn create_in_progress_task(service: &TaskService) -> Task {
+        let task = service
+            .create(&CreateTaskInput {
+                description: "Review test task".to_string(),
+                context: None,
+                parent_id: None,
+                priority: None,
+                blocked_by: vec![],
+            })
+            .unwrap();
+        service.start(&task.id).unwrap();
+        service.get(&task.id).unwrap()
+    }
+
+    #[test]
+    fn test_submit_review() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        let review = service.submit_review(&task.id).unwrap();
+        assert_eq!(review.task_id, task.id);
+        assert_eq!(review.status, ReviewStatus::GatesPending);
+        assert!(review.gates_completed_at.is_none());
+        assert!(review.agent_completed_at.is_none());
+        assert!(review.human_completed_at.is_none());
+    }
+
+    #[test]
+    fn test_submit_review_requires_in_progress() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = service
+            .create(&CreateTaskInput {
+                description: "Pending task".to_string(),
+                context: None,
+                parent_id: None,
+                priority: None,
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Pending task should not allow review submission
+        let result = service.submit_review(&task.id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_review_rejects_active_review() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        service.submit_review(&task.id).unwrap();
+
+        // Second submit should fail (active review exists)
+        let result = service.submit_review(&task.id);
+        assert!(matches!(result, Err(OsError::ActiveReviewExists(_))));
+    }
+
+    #[test]
+    fn test_review_full_approval_pipeline() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        // Submit -> GatesPending
+        let review = service.submit_review(&task.id).unwrap();
+        assert_eq!(review.status, ReviewStatus::GatesPending);
+
+        // ApproveGates -> AgentPending
+        let review = service.approve_gates(&review.id).unwrap();
+        assert_eq!(review.status, ReviewStatus::AgentPending);
+        assert!(review.gates_completed_at.is_some());
+
+        // ApproveAgent -> HumanPending
+        let review = service.approve_agent(&review.id).unwrap();
+        assert_eq!(review.status, ReviewStatus::HumanPending);
+        assert!(review.agent_completed_at.is_some());
+
+        // ApproveHuman -> Approved
+        let review = service.approve_human(&review.id).unwrap();
+        assert_eq!(review.status, ReviewStatus::Approved);
+        assert!(review.human_completed_at.is_some());
+    }
+
+    #[test]
+    fn test_review_request_changes() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        let review = service.submit_review(&task.id).unwrap();
+        let review = service.approve_gates(&review.id).unwrap();
+
+        // Request changes from AgentPending
+        let review = service.request_changes(&review.id).unwrap();
+        assert_eq!(review.status, ReviewStatus::ChangesRequested);
+    }
+
+    #[test]
+    fn test_review_invalid_transition() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        let review = service.submit_review(&task.id).unwrap();
+
+        // Cannot approve_agent from GatesPending (skip gates)
+        let result = service.approve_agent(&review.id);
+        assert!(matches!(
+            result,
+            Err(OsError::InvalidReviewTransition { .. })
+        ));
+
+        // Cannot approve_human from GatesPending
+        let result = service.approve_human(&review.id);
+        assert!(matches!(
+            result,
+            Err(OsError::InvalidReviewTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn test_review_changes_requested_is_terminal() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        let review = service.submit_review(&task.id).unwrap();
+        let review = service.request_changes(&review.id).unwrap();
+        assert_eq!(review.status, ReviewStatus::ChangesRequested);
+
+        // Cannot transition from ChangesRequested
+        assert!(service.approve_gates(&review.id).is_err());
+        assert!(service.request_changes(&review.id).is_err());
+    }
+
+    #[test]
+    fn test_review_new_submit_after_changes_requested() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        // First review -> request changes
+        let review1 = service.submit_review(&task.id).unwrap();
+        service.request_changes(&review1.id).unwrap();
+
+        // Second review is allowed (first is terminal)
+        let review2 = service.submit_review(&task.id).unwrap();
+        assert_eq!(review2.status, ReviewStatus::GatesPending);
+        assert_ne!(review1.id, review2.id);
+
+        // List shows both reviews
+        let reviews = service
+            .list_reviews(&ReviewFilter {
+                task_id: Some(task.id.clone()),
+                status: None,
+            })
+            .unwrap();
+        assert_eq!(reviews.len(), 2);
+    }
+
+    #[test]
+    fn test_review_get_active() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        // No active review initially
+        assert!(service.get_active_review(&task.id).unwrap().is_none());
+
+        // Submit -> active review exists
+        let review = service.submit_review(&task.id).unwrap();
+        let active = service.get_active_review(&task.id).unwrap().unwrap();
+        assert_eq!(active.id, review.id);
+
+        // After approval -> no active review
+        let review = service.approve_gates(&review.id).unwrap();
+        let review = service.approve_agent(&review.id).unwrap();
+        service.approve_human(&review.id).unwrap();
+        assert!(service.get_active_review(&task.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_review_approve_human_bridges_manual_gates() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        // Add a manual gate
+        let gate = service
+            .create_gate(&CreateGateInput {
+                name: "code-review".to_string(),
+                description: "Code review gate".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        // Full approval pipeline
+        let review = service.submit_review(&task.id).unwrap();
+        let review = service.approve_gates(&review.id).unwrap();
+        let review = service.approve_agent(&review.id).unwrap();
+        service.approve_human(&review.id).unwrap();
+
+        // Manual gate should now be passed (bridged)
+        let gate_result = gate_repo::get_result(self::tests::conn_ref(&conn), &gate.id, &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate_result.status, GateStatus::Pass);
+    }
+
+    #[test]
+    fn test_review_request_changes_bridges_manual_gates() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        // Add a manual gate
+        let gate = service
+            .create_gate(&CreateGateInput {
+                name: "code-review".to_string(),
+                description: "Code review gate".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        // Submit and request changes
+        let review = service.submit_review(&task.id).unwrap();
+        let review = service.approve_gates(&review.id).unwrap();
+        service.request_changes(&review.id).unwrap();
+
+        // Manual gate should now be failed (bridged)
+        let gate_result = gate_repo::get_result(self::tests::conn_ref(&conn), &gate.id, &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate_result.status, GateStatus::Fail);
+    }
+
+    // Helper to get a reference to the connection (workaround for borrowing in test)
+    fn conn_ref(conn: &rusqlite::Connection) -> &rusqlite::Connection {
+        conn
+    }
+
+    #[test]
+    fn test_review_list_by_status() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+        let task = create_in_progress_task(&service);
+
+        // Create and approve first review
+        let review1 = service.submit_review(&task.id).unwrap();
+        let review1 = service.approve_gates(&review1.id).unwrap();
+        let review1 = service.approve_agent(&review1.id).unwrap();
+        service.approve_human(&review1.id).unwrap();
+
+        // Create second review (new submission after approval)
+        let _review2 = service.submit_review(&task.id).unwrap();
+
+        // Filter by status
+        let approved = service
+            .list_reviews(&ReviewFilter {
+                task_id: None,
+                status: Some(ReviewStatus::Approved),
+            })
+            .unwrap();
+        assert_eq!(approved.len(), 1);
+
+        let pending = service
+            .list_reviews(&ReviewFilter {
+                task_id: None,
+                status: Some(ReviewStatus::GatesPending),
+            })
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+    }
 }
