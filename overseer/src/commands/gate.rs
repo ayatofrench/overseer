@@ -154,6 +154,9 @@ pub fn handle(conn: &Connection, cmd: GateCommand) -> Result<GateResultType> {
                 gate_type: args.gate_type,
                 task_id: args.task,
                 config,
+                command: args.command,
+                timeout_secs: args.timeout,
+                max_retries: args.max_retries,
                 required: args.required,
                 depth_filter: args.depth,
                 ordering: args.order,
@@ -183,12 +186,12 @@ pub fn handle(conn: &Connection, cmd: GateCommand) -> Result<GateResultType> {
         }
 
         GateCommand::Pass(args) => {
-            let result = svc.pass_gate(&args.task_id, &args.gate_id, args.output.as_deref())?;
+            let result = svc.pass_gate(&args.task_id, &args.gate_id, args.output.as_deref(), None)?;
             Ok(GateResultType::GateResult(result))
         }
 
         GateCommand::Fail(args) => {
-            let result = svc.fail_gate(&args.task_id, &args.gate_id, args.output.as_deref())?;
+            let result = svc.fail_gate(&args.task_id, &args.gate_id, args.output.as_deref(), None)?;
             Ok(GateResultType::GateResult(result))
         }
 
