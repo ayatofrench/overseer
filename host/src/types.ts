@@ -86,6 +86,8 @@ export interface Task {
   startCommit?: string;
   /** Computed: true if task or any ancestor has incomplete blockers */
   effectivelyBlocked: boolean;
+  /** Arbitrary JSON metadata stored in task_metadata table */
+  metadata?: Record<string, unknown>;
   /** Task was cancelled (abandoned without completion) */
   cancelled: boolean;
   /** Timestamp when task was cancelled */
@@ -128,6 +130,82 @@ export interface TaskProgress {
   completed: number;
   ready: number;     // !completed && !effectivelyBlocked
   blocked: number;   // !completed && effectivelyBlocked
+}
+
+// ============ Gate Types ============
+
+declare const GateIdBrand: unique symbol;
+export type GateId = string & { readonly [GateIdBrand]: never };
+
+export function isGateId(s: string): s is GateId {
+  return s.startsWith("gate_") && s.length === 31; // "gate_" + 26 ULID chars
+}
+
+export function parseGateId(s: string): GateId {
+  if (!isGateId(s)) {
+    throw new Error(`Invalid GateId: ${s}`);
+  }
+  return s;
+}
+
+export type GateType = "shell" | "metadata" | "manual";
+export type GateStatus = "pending" | "running" | "pass" | "fail" | "error" | "skip";
+export type VerifiedBy = "overseer" | "external";
+
+export interface Gate {
+  id: GateId;
+  taskId: string | null;
+  name: string;
+  description: string;
+  gateType: GateType;
+  config: Record<string, unknown>;
+  required: boolean;
+  appliesTo: string;
+  depthFilter: number | null;
+  ordering: number;
+  createdAt: string;
+}
+
+export interface GateResult {
+  gateId: GateId;
+  taskId: string;
+  status: GateStatus;
+  output: string | null;
+  exitCode: number | null;
+  startedAt: string;
+  completedAt: string | null;
+  commitSha: string | null;
+}
+
+export interface GateStatusEntry {
+  gate: Gate;
+  result: GateResult | null;
+  satisfied: boolean;
+  verifiedBy: VerifiedBy;
+}
+
+export interface GateStatusReport {
+  taskId: string;
+  running: boolean;
+  gates: GateStatusEntry[];
+  canComplete: boolean;
+}
+
+export interface UnsatisfiedGate {
+  gate: Gate;
+  result: GateResult | null;
+  reason: string;
+}
+
+export interface CreateGateInput {
+  name: string;
+  type: GateType;
+  taskId?: string;
+  config?: Record<string, unknown>;
+  required?: boolean;
+  depthFilter?: 0 | 1 | 2;
+  ordering?: number;
+  description?: string;
 }
 
 /**

@@ -1,10 +1,10 @@
 use rusqlite::Connection;
 
-use crate::core::TaskService;
-use crate::db::task_repo;
+use crate::core::{GateExecutor, TaskService};
+use crate::db::{gate_repo, task_repo};
 use crate::error::{NotReadyReason, OsError, Result};
 use crate::id::TaskId;
-use crate::types::Task;
+use crate::types::{GateResult, GateStatusReport, Task};
 use crate::vcs::backend::{VcsBackend, VcsError};
 
 /// Coordinates task state transitions with VCS operations.
@@ -37,7 +37,25 @@ impl<'a> TaskWorkflowService<'a> {
         &self.task_service
     }
 
+    /// Access the VCS backend
+    pub fn vcs_ref(&self) -> &dyn VcsBackend {
+        self.vcs.as_ref()
+    }
+
     pub fn start(&self, id: &TaskId) -> Result<Task> {
+        self.start_with_options(id, None, None)
+    }
+
+    /// Start a task with optional custom bookmark name and workspace path.
+    /// If `workspace_path` is provided, creates a jj workspace / git worktree at that path
+    /// instead of checking out in the current working copy.
+    /// If `custom_bookmark` is provided, uses that name instead of `task/{id}`.
+    pub fn start_with_options(
+        &self,
+        id: &TaskId,
+        custom_bookmark: Option<&str>,
+        workspace_path: Option<&str>,
+    ) -> Result<Task> {
         let task = self.task_service.get(id)?;
 
         // Guard: cannot start non-active tasks (cancelled, completed, archived)
@@ -58,9 +76,11 @@ impl<'a> TaskWorkflowService<'a> {
 
         // Idempotent: already started with VCS state
         if task.started_at.is_some() && task.bookmark.is_some() {
-            // Just checkout the existing bookmark
-            if let Some(ref bookmark) = task.bookmark {
-                self.vcs.checkout(bookmark)?;
+            // Just checkout the existing bookmark (skip if workspace mode — workspace already exists)
+            if workspace_path.is_none() {
+                if let Some(ref bookmark) = task.bookmark {
+                    self.vcs.checkout(bookmark)?;
+                }
             }
             return self.task_service.get(id);
         }
@@ -68,32 +88,45 @@ impl<'a> TaskWorkflowService<'a> {
         // Validate: must be the next ready task in its subtree
         self.validate_start_target(id, &task)?;
 
-        let bookmark = task
-            .bookmark
-            .clone()
+        let bookmark = custom_bookmark
+            .map(|s| s.to_string())
+            .or_else(|| task.bookmark.clone())
             .unwrap_or_else(|| format!("task/{}", id));
 
-        // 1. Ensure bookmark exists (idempotent)
-        match self.vcs.create_bookmark(&bookmark, None) {
-            Ok(()) | Err(VcsError::BookmarkExists(_)) => {}
-            Err(e) => return Err(e.into()),
+        if let Some(ws_path) = workspace_path {
+            // Workspace mode: create isolated workspace + bookmark
+            self.vcs.create_workspace(ws_path, &bookmark)?;
+
+            // Record start commit from root repo (workspace just forked from here)
+            let sha = self.vcs.current_commit_id()?;
+
+            // DB updates
+            task_repo::set_bookmark(self.conn, id, &bookmark)?;
+            task_repo::set_start_commit(self.conn, id, &sha)?;
+        } else {
+            // Classic mode: bookmark + checkout in current working copy
+            // 1. Ensure bookmark exists (idempotent)
+            match self.vcs.create_bookmark(&bookmark, None) {
+                Ok(()) | Err(VcsError::BookmarkExists(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+
+            // 2. Checkout (can fail on DirtyWorkingCopy)
+            self.vcs.checkout(&bookmark)?;
+
+            // 3. Record start commit
+            let sha = self.vcs.current_commit_id()?;
+
+            // 4. DB updates (after VCS succeeds)
+            task_repo::set_bookmark(self.conn, id, &bookmark)?;
+            task_repo::set_start_commit(self.conn, id, &sha)?;
         }
-
-        // 2. Checkout (can fail on DirtyWorkingCopy)
-        self.vcs.checkout(&bookmark)?;
-
-        // 3. Record start commit
-        let sha = self.vcs.current_commit_id()?;
-
-        // 4. DB updates (after VCS succeeds)
-        task_repo::set_bookmark(self.conn, id, &bookmark)?;
-        task_repo::set_start_commit(self.conn, id, &sha)?;
 
         if task.started_at.is_none() {
             self.task_service.start(id)?;
         }
 
-        // 5. Bubble started_at to ancestors (but not VCS state)
+        // Bubble started_at to ancestors (but not VCS state)
         self.bubble_start_to_ancestors(id)?;
 
         self.task_service.get(id)
@@ -214,11 +247,32 @@ impl<'a> TaskWorkflowService<'a> {
     /// Learnings are added to the task and bubbled to immediate parent.
     ///
     /// VCS-first ordering: commit changes before updating DB state.
+    /// If `force` is false, gate enforcement is checked before VCS ops.
     pub fn complete_with_learnings(
         &self,
         id: &TaskId,
         result: Option<&str>,
         learnings: &[String],
+    ) -> Result<Task> {
+        self.complete_with_learnings_opt(id, result, learnings, false)
+    }
+
+    pub fn complete_with_learnings_force(
+        &self,
+        id: &TaskId,
+        result: Option<&str>,
+        learnings: &[String],
+        force: bool,
+    ) -> Result<Task> {
+        self.complete_with_learnings_opt(id, result, learnings, force)
+    }
+
+    fn complete_with_learnings_opt(
+        &self,
+        id: &TaskId,
+        result: Option<&str>,
+        learnings: &[String],
+        force: bool,
     ) -> Result<Task> {
         let task = self.task_service.get(id)?;
 
@@ -238,6 +292,17 @@ impl<'a> TaskWorkflowService<'a> {
         // Auto-detect milestone (depth 0)
         if task.depth == Some(0) {
             return self.complete_milestone_with_learnings(id, result, learnings);
+        }
+
+        // Gate enforcement (before VCS ops)
+        if !force {
+            let unsatisfied = self.task_service.check_gates(id)?;
+            if !unsatisfied.is_empty() {
+                return Err(OsError::GatesNotSatisfied {
+                    task_id: id.clone(),
+                    gates: unsatisfied,
+                });
+            }
         }
 
         // 1. VCS first - commit (NothingToCommit is OK)
@@ -314,6 +379,11 @@ impl<'a> TaskWorkflowService<'a> {
 
             // Auto-complete parent (use service method to handle depth-0 special case)
             if parent.depth == Some(0) {
+                // Check gates before auto-completing milestone
+                let unsatisfied = self.task_service.check_gates(&parent_id)?;
+                if !unsatisfied.is_empty() {
+                    break; // Unsatisfied gates stop bubbling (like pending children)
+                }
                 self.complete_milestone(&parent_id, None)?;
             } else {
                 self.task_service.complete(&parent_id, None)?;
@@ -368,6 +438,15 @@ impl<'a> TaskWorkflowService<'a> {
                 .complete_with_learnings(id, result, learnings)?;
 
             return Ok(completed_task);
+        }
+
+        // Gate enforcement for milestone (before VCS ops)
+        let unsatisfied = self.task_service.check_gates(id)?;
+        if !unsatisfied.is_empty() {
+            return Err(OsError::GatesNotSatisfied {
+                task_id: id.clone(),
+                gates: unsatisfied,
+            });
         }
 
         // Milestone: VCS first - commit (NothingToCommit is OK)
@@ -438,6 +517,44 @@ impl<'a> TaskWorkflowService<'a> {
 
         Ok(completed_task)
     }
+
+    /// Run all applicable gates for a task.
+    /// Writes pending results, then executes gates synchronously (for worker process).
+    /// Returns the status report after execution.
+    pub fn run_gates(
+        &self,
+        task_id: &TaskId,
+        commit_sha: Option<&str>,
+    ) -> Result<GateStatusReport> {
+        // Check if a run is already in progress
+        if gate_repo::has_active_run(self.conn, task_id)? {
+            // Return current status instead of starting new run
+            return self.task_service.get_gate_status(task_id);
+        }
+
+        let depth = self.task_service.get_depth(task_id)?;
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+
+        // Write pending results for all gates
+        for gate in &gates {
+            gate_repo::set_result(
+                self.conn,
+                &gate.id,
+                task_id,
+                crate::types::GateStatus::Pending,
+                None,
+                None,
+                commit_sha,
+            )?;
+        }
+
+        // Execute gates synchronously (this is the worker path)
+        let executor = GateExecutor::new(self.conn);
+        executor.run_all(task_id, commit_sha)?;
+
+        // Return final status
+        self.task_service.get_gate_status(task_id)
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +612,9 @@ mod tests {
             Ok(vec![])
         }
         fn checkout(&self, _target: &str) -> VcsResult<()> {
+            Ok(())
+        }
+        fn create_workspace(&self, _path: &str, _name: &str) -> VcsResult<()> {
             Ok(())
         }
     }
@@ -1343,5 +1463,281 @@ mod tests {
             "Expected CannotCompleteArchived error, got {:?}",
             result
         );
+    }
+
+    // ============ Gate Tests ============
+
+    #[test]
+    fn test_manual_gate_skip_is_unsatisfied() {
+        let conn = setup_db();
+        let svc = TaskService::new(&conn);
+
+        let task = svc
+            .create(&CreateTaskInput {
+                description: "Task".to_string(),
+                context: None,
+                parent_id: None,
+                priority: None,
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Create a required manual gate
+        let gate = svc
+            .create_gate(&crate::types::CreateGateInput {
+                name: "code-review".to_string(),
+                description: "Manual code review".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        // Set manual gate to Skip (as run_all does)
+        gate_repo::set_result(
+            &conn,
+            &gate.id,
+            &task.id,
+            crate::types::GateStatus::Skip,
+            Some("manual gate — use `os gate pass`"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // check_gates should report unsatisfied (Skip + Manual = unsatisfied)
+        let unsatisfied = svc.check_gates(&task.id).unwrap();
+        assert_eq!(unsatisfied.len(), 1);
+        assert_eq!(unsatisfied[0].reason, "requires explicit pass");
+    }
+
+    #[test]
+    fn test_shell_gate_skip_is_satisfied() {
+        let conn = setup_db();
+        let svc = TaskService::new(&conn);
+
+        let task = svc
+            .create(&CreateTaskInput {
+                description: "Task".to_string(),
+                context: None,
+                parent_id: None,
+                priority: None,
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Create a required shell gate
+        let gate = svc
+            .create_gate(&crate::types::CreateGateInput {
+                name: "tests".to_string(),
+                description: "Run tests".to_string(),
+                gate_type: "shell".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        // Set shell gate to Skip
+        gate_repo::set_result(
+            &conn,
+            &gate.id,
+            &task.id,
+            crate::types::GateStatus::Skip,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // check_gates should report satisfied (Skip + Shell = satisfied)
+        let unsatisfied = svc.check_gates(&task.id).unwrap();
+        assert!(
+            unsatisfied.is_empty(),
+            "Shell gate with Skip should be satisfied"
+        );
+    }
+
+    #[test]
+    fn test_manual_gate_blocks_task_complete() {
+        let conn = setup_db();
+        let service = TaskWorkflowService::new(&conn, mock_vcs());
+        let svc = service.task_service();
+
+        let task = svc
+            .create(&CreateTaskInput {
+                description: "Task".to_string(),
+                context: None,
+                parent_id: None,
+                priority: None,
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Create required manual gate
+        let gate = svc
+            .create_gate(&crate::types::CreateGateInput {
+                name: "code-review".to_string(),
+                description: "".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        // Set to Skip (simulating run_all)
+        gate_repo::set_result(
+            &conn,
+            &gate.id,
+            &task.id,
+            crate::types::GateStatus::Skip,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Complete should fail with GatesNotSatisfied
+        let result = service.complete(&task.id, None);
+        assert!(
+            matches!(result, Err(OsError::GatesNotSatisfied { .. })),
+            "Expected GatesNotSatisfied, got {:?}",
+            result
+        );
+
+        // Pass the gate explicitly
+        svc.pass_gate(&task.id, &gate.id, Some("Approved"))
+            .unwrap();
+
+        // Now complete should succeed
+        let completed = service.complete(&task.id, None).unwrap();
+        assert!(completed.completed);
+    }
+
+    #[test]
+    fn test_milestone_complete_blocked_by_gate() {
+        let conn = setup_db();
+        let service = TaskWorkflowService::new(&conn, mock_vcs());
+        let svc = service.task_service();
+
+        // Create milestone with a child task
+        let milestone = svc
+            .create(&CreateTaskInput {
+                description: "Milestone".to_string(),
+                context: None,
+                parent_id: None,
+                priority: Some(0),
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        let task = svc
+            .create(&CreateTaskInput {
+                description: "Task".to_string(),
+                context: None,
+                parent_id: Some(milestone.id.clone()),
+                priority: Some(0),
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Create required manual gate on milestone
+        let gate = svc
+            .create_gate(&crate::types::CreateGateInput {
+                name: "release-approval".to_string(),
+                description: "".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(milestone.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        // Set gate to Skip
+        gate_repo::set_result(
+            &conn,
+            &gate.id,
+            &milestone.id,
+            crate::types::GateStatus::Skip,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Complete child task
+        service.complete(&task.id, None).unwrap();
+
+        // Milestone should NOT be auto-completed (gate unsatisfied)
+        let milestone_after = svc.get(&milestone.id).unwrap();
+        assert!(
+            !milestone_after.completed,
+            "Milestone should not auto-complete with unsatisfied gate"
+        );
+
+        // Pass the gate
+        svc.pass_gate(&milestone.id, &gate.id, Some("Approved"))
+            .unwrap();
+
+        // Now explicitly completing milestone should work
+        let completed = service.complete_milestone(&milestone.id, None).unwrap();
+        assert!(completed.completed);
+    }
+
+    #[test]
+    fn test_gate_status_manual_skip_not_satisfied() {
+        let conn = setup_db();
+        let svc = TaskService::new(&conn);
+
+        let task = svc
+            .create(&CreateTaskInput {
+                description: "Task".to_string(),
+                context: None,
+                parent_id: None,
+                priority: None,
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Create manual gate and set to Skip
+        let gate = svc
+            .create_gate(&crate::types::CreateGateInput {
+                name: "review".to_string(),
+                description: "".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            })
+            .unwrap();
+
+        gate_repo::set_result(
+            &conn,
+            &gate.id,
+            &task.id,
+            crate::types::GateStatus::Skip,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // get_gate_status should show not satisfied and canComplete = false
+        let status = svc.get_gate_status(&task.id).unwrap();
+        assert!(!status.can_complete);
+        assert_eq!(status.gates.len(), 1);
+        assert!(!status.gates[0].satisfied);
     }
 }

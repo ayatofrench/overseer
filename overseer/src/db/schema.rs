@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
     let current_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -56,10 +56,44 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived);
             CREATE INDEX IF NOT EXISTS idx_learnings_task ON learnings(task_id);
             CREATE INDEX IF NOT EXISTS idx_blockers_blocker ON task_blockers(blocker_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_learnings_unique 
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_learnings_unique
                 ON learnings(task_id, source_task_id, content);
-            CREATE INDEX IF NOT EXISTS idx_learnings_task_created 
+            CREATE INDEX IF NOT EXISTS idx_learnings_task_created
                 ON learnings(task_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS gates (
+                id TEXT PRIMARY KEY CHECK (id LIKE 'gate_%'),
+                task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                gate_type TEXT NOT NULL CHECK (gate_type IN ('shell', 'metadata', 'manual')),
+                config TEXT NOT NULL DEFAULT '{}',
+                required INTEGER NOT NULL DEFAULT 1,
+                applies_to TEXT NOT NULL DEFAULT 'complete' CHECK (applies_to IN ('complete')),
+                depth_filter INTEGER CHECK (depth_filter BETWEEN 0 AND 2),
+                ordering INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS gate_results (
+                gate_id TEXT NOT NULL REFERENCES gates(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'pass', 'fail', 'error', 'skip')),
+                output TEXT,
+                exit_code INTEGER,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                commit_sha TEXT,
+                PRIMARY KEY (gate_id, task_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gates_task ON gates(task_id);
+            CREATE INDEX IF NOT EXISTS idx_gates_project ON gates(task_id) WHERE task_id IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_gate_results_task ON gate_results(task_id);
+            CREATE INDEX IF NOT EXISTS idx_gate_results_status ON gate_results(status)
+                WHERE status IN ('pending', 'running');
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gates_name_scope
+                ON gates(COALESCE(task_id, ''), name);
 
             PRAGMA journal_mode = WAL;
             "#,
@@ -142,6 +176,51 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 5)?;
         version = 5;
+    }
+
+    // Migration for version 5 -> 6: Add gates and gate_results tables
+    if version == 5 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS gates (
+                id TEXT PRIMARY KEY CHECK (id LIKE 'gate_%'),
+                task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                gate_type TEXT NOT NULL CHECK (gate_type IN ('shell', 'metadata', 'manual')),
+                config TEXT NOT NULL DEFAULT '{}',
+                required INTEGER NOT NULL DEFAULT 1,
+                applies_to TEXT NOT NULL DEFAULT 'complete' CHECK (applies_to IN ('complete')),
+                depth_filter INTEGER CHECK (depth_filter BETWEEN 0 AND 2),
+                ordering INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS gate_results (
+                gate_id TEXT NOT NULL REFERENCES gates(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'pass', 'fail', 'error', 'skip')),
+                output TEXT,
+                exit_code INTEGER,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                commit_sha TEXT,
+                PRIMARY KEY (gate_id, task_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gates_task ON gates(task_id);
+            CREATE INDEX IF NOT EXISTS idx_gates_project ON gates(task_id) WHERE task_id IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_gate_results_task ON gate_results(task_id);
+            CREATE INDEX IF NOT EXISTS idx_gate_results_status ON gate_results(status)
+                WHERE status IN ('pending', 'running');
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gates_name_scope
+                ON gates(COALESCE(task_id, ''), name);
+            COMMIT;
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 6)?;
+        version = 6;
     }
 
     // Suppress unused variable warning - version is used for sequential migration chaining

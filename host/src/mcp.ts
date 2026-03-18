@@ -34,6 +34,7 @@ interface Task {
   bookmark?: string;            // VCS bookmark name (if started)
   startCommit?: string;         // Commit SHA at start
   effectivelyBlocked: boolean;  // True if task OR ancestor has incomplete blockers
+  metadata?: Record<string, unknown>;  // Arbitrary JSON metadata
   cancelled: boolean;           // Task was cancelled (does NOT satisfy blockers)
   cancelledAt: string | null;
   archived: boolean;            // Task is archived (hidden from default list)
@@ -85,7 +86,7 @@ declare const tasks: {
     priority?: 0 | 1 | 2;
     parentId?: string;
   }): Promise<Task>;
-  start(id: string): Promise<Task>;  // VCS required: creates bookmark, records start commit
+  start(id: string, options?: { bookmark?: string; workspace?: string }): Promise<Task>;  // VCS required: creates bookmark, records start commit. workspace creates isolated jj workspace / git worktree.
   complete(id: string, options?: { result?: string; learnings?: string[] }): Promise<Task>;  // VCS required: commits changes (NothingToCommit = success)
   reopen(id: string): Promise<Task>;
   cancel(id: string): Promise<Task>;  // Cancel task (does NOT satisfy blockers)
@@ -97,11 +98,81 @@ declare const tasks: {
   tree(rootId?: string): Promise<TaskTree | TaskTree[]>;  // Returns single tree if rootId, array of all milestone trees if not
   search(query: string): Promise<Task[]>;  // Search by description/context/result (case-insensitive)
   progress(rootId?: string): Promise<TaskProgress>;  // Aggregate counts for milestone or all tasks
+  getMetadata(id: string): Promise<Record<string, unknown> | null>;  // Get task metadata
+  setMetadata(id: string, data: Record<string, unknown>): Promise<Record<string, unknown> | null>;  // Set (upsert) task metadata
+  deleteMetadata(id: string): Promise<void>;  // Delete task metadata
 };
 
 // Learnings API (learnings are added via tasks.complete)
 declare const learnings: {
   list(taskId: string): Promise<Learning[]>;
+};
+
+// Gates API (quality gates: shell, metadata, manual)
+interface Gate {
+  id: string;
+  taskId: string | null;
+  name: string;
+  description: string;
+  gateType: "shell" | "metadata" | "manual";
+  config: Record<string, unknown>;
+  required: boolean;
+  appliesTo: string;
+  depthFilter: number | null;
+  ordering: number;
+  createdAt: string;
+}
+
+interface GateResult {
+  gateId: string;
+  taskId: string;
+  status: "pending" | "running" | "pass" | "fail" | "error" | "skip";
+  output: string | null;
+  exitCode: number | null;
+  startedAt: string;
+  completedAt: string | null;
+  commitSha: string | null;
+}
+
+interface GateStatusEntry {
+  gate: Gate;
+  result: GateResult | null;
+  satisfied: boolean;
+  verifiedBy: "overseer" | "external";
+}
+
+interface GateStatusReport {
+  taskId: string;
+  running: boolean;
+  gates: GateStatusEntry[];
+  canComplete: boolean;
+}
+
+interface UnsatisfiedGate {
+  gate: Gate;
+  result: GateResult | null;
+  reason: string;
+}
+
+declare const gates: {
+  add(input: {
+    name: string;
+    type: "shell" | "metadata" | "manual";
+    taskId?: string;          // omit for project-level
+    config?: Record<string, unknown>;
+    required?: boolean;       // default: true
+    depthFilter?: 0 | 1 | 2;
+    ordering?: number;
+    description?: string;
+  }): Promise<Gate>;
+  list(taskId?: string): Promise<Gate[]>;
+  delete(id: string): Promise<void>;
+  run(taskId: string, gateId?: string): Promise<GateStatusReport>;   // Runs shell gates synchronously. Manual gates skipped (use pass/fail).
+  status(taskId: string): Promise<GateStatusReport>;                  // Get per-gate status + canComplete
+  output(taskId: string, gateId: string): Promise<string | null>;     // Get stored gate output
+  pass(taskId: string, gateId: string, output?: string): Promise<GateResult>;   // Pass manual gate
+  fail(taskId: string, gateId: string, output?: string): Promise<GateResult>;   // Fail manual gate
+  check(taskId: string): Promise<UnsatisfiedGate[]>;                  // Pre-flight: empty = can complete
 };
 \`\`\`
 
@@ -161,6 +232,30 @@ const archivedOnly = await tasks.list({ archived: true });
 
 // Include all tasks (archived and non-archived)
 const allTasks = await tasks.list({ archived: "all" });
+
+// Register a project-level shell gate
+await gates.add({
+  name: "tests",
+  type: "shell",
+  depthFilter: 1,
+  ordering: 10,
+  config: { command: "npm test", cwd: "{{workspace}}" }
+});
+
+// Register a per-task manual gate
+await gates.add({ name: "code-review", type: "manual", taskId: task.id, ordering: 30 });
+
+// Run shell gates for a task
+const status = await gates.run(task.id);
+
+// Pass a manual gate after review
+await gates.pass(task.id, gateId, "Approved: no issues found");
+
+// Pre-flight check before completing
+const unsatisfied = await gates.check(task.id);
+if (unsatisfied.length === 0) {
+  await tasks.complete(task.id, { result: "Done" });
+}
 \`\`\`
 `.trim();
 

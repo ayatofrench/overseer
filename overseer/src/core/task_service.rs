@@ -2,12 +2,13 @@ use std::collections::HashSet;
 
 use rusqlite::Connection;
 
-use crate::db::{self, learning_repo, task_repo};
+use crate::db::{self, gate_repo, learning_repo, task_repo};
 use crate::error::{OsError, Result};
-use crate::id::TaskId;
+use crate::id::{GateId, TaskId};
 use crate::types::{
-    CreateTaskInput, InheritedLearnings, LifecycleState, ListTasksFilter, Task, TaskContext,
-    UpdateTaskInput,
+    CreateGateInput, CreateTaskInput, Gate, GateFilter, GateResult, GateStatus, GateStatusEntry,
+    GateStatusReport, GateType, InheritedLearnings, LifecycleState, ListTasksFilter, Task,
+    TaskContext, UnsatisfiedGate, UpdateTaskInput, VerifiedBy,
 };
 use crate::vcs;
 
@@ -80,6 +81,7 @@ impl<'a> TaskService<'a> {
         task.effectively_blocked = self.is_effectively_blocked(&task)?;
         task.context_chain = Some(self.assemble_context_chain(&task)?);
         task.learnings = Some(self.assemble_inherited_learnings(&task)?);
+        task.metadata = task_repo::get_metadata(self.conn, id)?;
         Ok(task)
     }
 
@@ -270,6 +272,29 @@ impl<'a> TaskService<'a> {
         task_repo::delete_task(self.conn, id)
     }
 
+    // --- Metadata operations ---
+
+    pub fn get_metadata(&self, id: &TaskId) -> Result<Option<serde_json::Value>> {
+        if !task_repo::task_exists(self.conn, id)? {
+            return Err(OsError::TaskNotFound(id.clone()));
+        }
+        task_repo::get_metadata(self.conn, id)
+    }
+
+    pub fn set_metadata(&self, id: &TaskId, data: &serde_json::Value) -> Result<()> {
+        if !task_repo::task_exists(self.conn, id)? {
+            return Err(OsError::TaskNotFound(id.clone()));
+        }
+        task_repo::set_metadata(self.conn, id, data)
+    }
+
+    pub fn delete_metadata(&self, id: &TaskId) -> Result<()> {
+        if !task_repo::task_exists(self.conn, id)? {
+            return Err(OsError::TaskNotFound(id.clone()));
+        }
+        task_repo::delete_metadata(self.conn, id)
+    }
+
     /// Cancel a task using lifecycle state validation.
     ///
     /// Allowed transitions:
@@ -416,7 +441,7 @@ impl<'a> TaskService<'a> {
         self.get(task_id)
     }
 
-    fn get_depth(&self, id: &TaskId) -> Result<i32> {
+    pub(crate) fn get_depth(&self, id: &TaskId) -> Result<i32> {
         task_repo::get_task_depth(self.conn, id)
     }
 
@@ -838,6 +863,158 @@ impl<'a> TaskService<'a> {
         }
 
         Ok(false)
+    }
+
+    // ============ Gate Methods ============
+
+    pub fn create_gate(&self, input: &CreateGateInput) -> Result<Gate> {
+        // Validate gate type
+        let _: GateType = input
+            .gate_type
+            .parse()
+            .map_err(|_| OsError::InvalidGateType(input.gate_type.clone()))?;
+
+        // Validate task exists if task-specific
+        if let Some(ref task_id) = input.task_id {
+            if !task_repo::task_exists(self.conn, task_id)? {
+                return Err(OsError::TaskNotFound(task_id.clone()));
+            }
+        }
+
+        gate_repo::create_gate(self.conn, input)
+    }
+
+    pub fn list_gates(&self, filter: &GateFilter) -> Result<Vec<Gate>> {
+        gate_repo::list_gates(self.conn, filter)
+    }
+
+    pub fn delete_gate(&self, id: &GateId) -> Result<()> {
+        gate_repo::delete_gate(self.conn, id)
+    }
+
+    pub fn get_gate_status(&self, task_id: &TaskId) -> Result<GateStatusReport> {
+        let task = self.get_task_or_err(task_id)?;
+        let depth = self.get_depth(task_id)?;
+
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+        let results = gate_repo::get_results(self.conn, task_id)?;
+        let result_map: std::collections::HashMap<GateId, GateResult> = results
+            .into_iter()
+            .map(|r| (r.gate_id.clone(), r))
+            .collect();
+
+        let mut running = false;
+        let mut can_complete = true;
+        let mut entries = Vec::new();
+
+        for gate in gates {
+            let result = result_map.get(&gate.id).cloned();
+            let verified_by = match gate.gate_type {
+                GateType::Manual => VerifiedBy::External,
+                _ => VerifiedBy::Overseer,
+            };
+
+            let satisfied = match &result {
+                Some(r) => match r.status {
+                    GateStatus::Pass => true,
+                    GateStatus::Skip => gate.gate_type != GateType::Manual,
+                    _ => false,
+                },
+                None => false,
+            };
+
+            if let Some(ref r) = result {
+                if matches!(r.status, GateStatus::Pending | GateStatus::Running) {
+                    running = true;
+                }
+            }
+
+            if gate.required && !satisfied {
+                can_complete = false;
+            }
+
+            entries.push(GateStatusEntry {
+                gate,
+                result,
+                satisfied,
+                verified_by,
+            });
+        }
+
+        // Also can't complete if task has other issues
+        let _ = task;
+
+        Ok(GateStatusReport {
+            task_id: task_id.clone(),
+            running,
+            gates: entries,
+            can_complete,
+        })
+    }
+
+    pub fn check_gates(&self, task_id: &TaskId) -> Result<Vec<UnsatisfiedGate>> {
+        let depth = self.get_depth(task_id)?;
+        gate_repo::check_gates(self.conn, task_id, depth, "complete")
+    }
+
+    /// Pass a manual gate. Rejects non-manual gates.
+    pub fn pass_gate(
+        &self,
+        task_id: &TaskId,
+        gate_id: &GateId,
+        output: Option<&str>,
+    ) -> Result<GateResult> {
+        let gate = gate_repo::get_gate(self.conn, gate_id)?
+            .ok_or_else(|| OsError::GateNotFound(gate_id.clone()))?;
+
+        if gate.gate_type != GateType::Manual {
+            return Err(OsError::GateNotManual(gate_id.clone()));
+        }
+
+        gate_repo::set_result(
+            self.conn,
+            gate_id,
+            task_id,
+            GateStatus::Pass,
+            output,
+            None,
+            None,
+        )
+    }
+
+    /// Fail a manual gate. Rejects non-manual gates.
+    pub fn fail_gate(
+        &self,
+        task_id: &TaskId,
+        gate_id: &GateId,
+        output: Option<&str>,
+    ) -> Result<GateResult> {
+        let gate = gate_repo::get_gate(self.conn, gate_id)?
+            .ok_or_else(|| OsError::GateNotFound(gate_id.clone()))?;
+
+        if gate.gate_type != GateType::Manual {
+            return Err(OsError::GateNotManual(gate_id.clone()));
+        }
+
+        gate_repo::set_result(
+            self.conn,
+            gate_id,
+            task_id,
+            GateStatus::Fail,
+            output,
+            None,
+            None,
+        )
+    }
+
+    /// Get stored output for a specific gate result.
+    pub fn get_gate_output(
+        &self,
+        task_id: &TaskId,
+        gate_id: &GateId,
+    ) -> Result<Option<String>> {
+        let result = gate_repo::get_result(self.conn, gate_id, task_id)?;
+        Ok(result.and_then(|r| r.output))
     }
 }
 

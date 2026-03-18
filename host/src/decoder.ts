@@ -6,17 +6,27 @@ import { Result, TaggedError } from "better-result";
 import {
   isTaskId,
   isLearningId,
+  isGateId,
   type Task,
   type TaskWithContext,
   type Learning,
   type TaskId,
   type LearningId,
+  type GateId,
   type Priority,
   type Depth,
   type TaskContext,
   type InheritedLearnings,
   type TaskTree,
   type TaskProgress,
+  type Gate,
+  type GateType,
+  type GateStatus,
+  type GateResult,
+  type GateStatusEntry,
+  type GateStatusReport,
+  type UnsatisfiedGate,
+  type VerifiedBy,
 } from "./types.js";
 
 /**
@@ -261,6 +271,15 @@ export function decodeTask(v: unknown): Result<Task, DecodeError> {
   if (bookmark !== undefined) task.bookmark = bookmark as string;
   if (startCommit !== undefined) task.startCommit = startCommit as string;
 
+  // Optional metadata field (arbitrary JSON object)
+  const { metadata } = v;
+  if (metadata !== undefined && metadata !== null) {
+    if (!isObject(metadata)) {
+      return Result.err(new DecodeError({ message: "Task metadata must be object" }));
+    }
+    task.metadata = metadata as Record<string, unknown>;
+  }
+
   return Result.ok(task);
 }
 
@@ -470,4 +489,289 @@ export function decodeTaskProgress(v: unknown): Result<TaskProgress, DecodeError
   }
 
   return Result.ok({ total, completed, ready, blocked });
+}
+
+// ============ Gate Decoders ============
+
+const GATE_TYPES = new Set(["shell", "metadata", "manual"]);
+const GATE_STATUSES = new Set(["pending", "running", "pass", "fail", "error", "skip"]);
+const VERIFIED_BY_VALUES = new Set(["overseer", "external"]);
+
+function isGateType(v: unknown): v is GateType {
+  return isString(v) && GATE_TYPES.has(v);
+}
+
+function isGateStatus(v: unknown): v is GateStatus {
+  return isString(v) && GATE_STATUSES.has(v);
+}
+
+function isVerifiedBy(v: unknown): v is VerifiedBy {
+  return isString(v) && VERIFIED_BY_VALUES.has(v);
+}
+
+/**
+ * Decode a Gate from unknown JSON
+ */
+export function decodeGate(v: unknown): Result<Gate, DecodeError> {
+  if (!isObject(v)) {
+    return Result.err(new DecodeError({ message: "Gate must be object" }));
+  }
+
+  const { id, taskId, name, description, gateType, config, required, appliesTo, depthFilter, ordering, createdAt } = v;
+
+  if (!isString(id) || !isGateId(id)) {
+    return Result.err(new DecodeError({ message: `Invalid gate id: ${id}` }));
+  }
+  if (taskId !== null && taskId !== undefined && !isString(taskId)) {
+    return Result.err(new DecodeError({ message: `Invalid gate taskId: ${taskId}` }));
+  }
+  if (!isString(name)) {
+    return Result.err(new DecodeError({ message: "Gate name must be string" }));
+  }
+  if (!isString(description)) {
+    return Result.err(new DecodeError({ message: "Gate description must be string" }));
+  }
+  if (!isGateType(gateType)) {
+    return Result.err(new DecodeError({ message: `Invalid gate type: ${gateType}` }));
+  }
+  if (!isObject(config)) {
+    return Result.err(new DecodeError({ message: "Gate config must be object" }));
+  }
+  if (!isBoolean(required)) {
+    return Result.err(new DecodeError({ message: "Gate required must be boolean" }));
+  }
+  if (!isString(appliesTo)) {
+    return Result.err(new DecodeError({ message: "Gate appliesTo must be string" }));
+  }
+  if (depthFilter !== null && depthFilter !== undefined && !isNumber(depthFilter)) {
+    return Result.err(new DecodeError({ message: "Gate depthFilter must be number or null" }));
+  }
+  if (!isNumber(ordering)) {
+    return Result.err(new DecodeError({ message: "Gate ordering must be number" }));
+  }
+  if (!isString(createdAt)) {
+    return Result.err(new DecodeError({ message: "Gate createdAt must be string" }));
+  }
+
+  return Result.ok({
+    id: id as GateId,
+    taskId: (taskId ?? null) as string | null,
+    name,
+    description,
+    gateType: gateType as GateType,
+    config: config as Record<string, unknown>,
+    required,
+    appliesTo,
+    depthFilter: (depthFilter ?? null) as number | null,
+    ordering,
+    createdAt,
+  });
+}
+
+/**
+ * Decode a Gate array
+ */
+export function decodeGates(v: unknown): Result<Gate[], DecodeError> {
+  if (!Array.isArray(v)) {
+    return Result.err(new DecodeError({ message: "Gates must be array" }));
+  }
+
+  const gates: Gate[] = [];
+  for (let i = 0; i < v.length; i++) {
+    const result = decodeGate(v[i]);
+    if (result.isErr()) {
+      return Result.err(new DecodeError({ message: result.error.message, path: `gates[${i}]` }));
+    }
+    gates.push(result.value);
+  }
+  return Result.ok(gates);
+}
+
+/**
+ * Decode a GateResult from unknown JSON
+ */
+export function decodeGateResult(v: unknown): Result<GateResult, DecodeError> {
+  if (!isObject(v)) {
+    return Result.err(new DecodeError({ message: "GateResult must be object" }));
+  }
+
+  const { gateId, taskId, status, output, exitCode, startedAt, completedAt, commitSha } = v;
+
+  if (!isString(gateId) || !isGateId(gateId)) {
+    return Result.err(new DecodeError({ message: `Invalid gate result gateId: ${gateId}` }));
+  }
+  if (!isString(taskId)) {
+    return Result.err(new DecodeError({ message: "GateResult taskId must be string" }));
+  }
+  if (!isGateStatus(status)) {
+    return Result.err(new DecodeError({ message: `Invalid gate result status: ${status}` }));
+  }
+  if (output !== null && !isString(output)) {
+    return Result.err(new DecodeError({ message: "GateResult output must be string or null" }));
+  }
+  if (exitCode !== null && !isNumber(exitCode)) {
+    return Result.err(new DecodeError({ message: "GateResult exitCode must be number or null" }));
+  }
+  if (!isString(startedAt)) {
+    return Result.err(new DecodeError({ message: "GateResult startedAt must be string" }));
+  }
+  if (completedAt !== null && !isString(completedAt)) {
+    return Result.err(new DecodeError({ message: "GateResult completedAt must be string or null" }));
+  }
+  if (commitSha !== null && !isString(commitSha)) {
+    return Result.err(new DecodeError({ message: "GateResult commitSha must be string or null" }));
+  }
+
+  return Result.ok({
+    gateId: gateId as GateId,
+    taskId: taskId as string,
+    status: status as GateStatus,
+    output: (output ?? null) as string | null,
+    exitCode: (exitCode ?? null) as number | null,
+    startedAt,
+    completedAt: (completedAt ?? null) as string | null,
+    commitSha: (commitSha ?? null) as string | null,
+  });
+}
+
+/**
+ * Decode a GateStatusEntry from unknown JSON
+ */
+function decodeGateStatusEntry(v: unknown): Result<GateStatusEntry, DecodeError> {
+  if (!isObject(v)) {
+    return Result.err(new DecodeError({ message: "GateStatusEntry must be object" }));
+  }
+
+  const { gate, result, satisfied, verifiedBy } = v;
+
+  const gateResult = decodeGate(gate);
+  if (gateResult.isErr()) {
+    return Result.err(new DecodeError({ message: gateResult.error.message, path: "gate" }));
+  }
+
+  let decodedResult: GateResult | null = null;
+  if (result !== null && result !== undefined) {
+    const resultDecode = decodeGateResult(result);
+    if (resultDecode.isErr()) {
+      return Result.err(new DecodeError({ message: resultDecode.error.message, path: "result" }));
+    }
+    decodedResult = resultDecode.value;
+  }
+
+  if (!isBoolean(satisfied)) {
+    return Result.err(new DecodeError({ message: "GateStatusEntry satisfied must be boolean" }));
+  }
+  if (!isVerifiedBy(verifiedBy)) {
+    return Result.err(new DecodeError({ message: `Invalid verifiedBy: ${verifiedBy}` }));
+  }
+
+  return Result.ok({
+    gate: gateResult.value,
+    result: decodedResult,
+    satisfied,
+    verifiedBy: verifiedBy as VerifiedBy,
+  });
+}
+
+/**
+ * Decode a GateStatusReport from unknown JSON
+ */
+export function decodeGateStatusReport(v: unknown): Result<GateStatusReport, DecodeError> {
+  if (!isObject(v)) {
+    return Result.err(new DecodeError({ message: "GateStatusReport must be object" }));
+  }
+
+  const { taskId, running, gates, canComplete } = v;
+
+  if (!isString(taskId)) {
+    return Result.err(new DecodeError({ message: "GateStatusReport taskId must be string" }));
+  }
+  if (!isBoolean(running)) {
+    return Result.err(new DecodeError({ message: "GateStatusReport running must be boolean" }));
+  }
+  if (!Array.isArray(gates)) {
+    return Result.err(new DecodeError({ message: "GateStatusReport gates must be array" }));
+  }
+  if (!isBoolean(canComplete)) {
+    return Result.err(new DecodeError({ message: "GateStatusReport canComplete must be boolean" }));
+  }
+
+  const decodedGates: GateStatusEntry[] = [];
+  for (let i = 0; i < gates.length; i++) {
+    const result = decodeGateStatusEntry(gates[i]);
+    if (result.isErr()) {
+      return Result.err(new DecodeError({ message: result.error.message, path: `gates[${i}]` }));
+    }
+    decodedGates.push(result.value);
+  }
+
+  return Result.ok({
+    taskId,
+    running,
+    gates: decodedGates,
+    canComplete,
+  });
+}
+
+/**
+ * Decode an UnsatisfiedGate from unknown JSON
+ */
+function decodeUnsatisfiedGate(v: unknown): Result<UnsatisfiedGate, DecodeError> {
+  if (!isObject(v)) {
+    return Result.err(new DecodeError({ message: "UnsatisfiedGate must be object" }));
+  }
+
+  const { gate, result, reason } = v;
+
+  const gateResult = decodeGate(gate);
+  if (gateResult.isErr()) {
+    return Result.err(new DecodeError({ message: gateResult.error.message, path: "gate" }));
+  }
+
+  let decodedResult: GateResult | null = null;
+  if (result !== null && result !== undefined) {
+    const resultDecode = decodeGateResult(result);
+    if (resultDecode.isErr()) {
+      return Result.err(new DecodeError({ message: resultDecode.error.message, path: "result" }));
+    }
+    decodedResult = resultDecode.value;
+  }
+
+  if (!isString(reason)) {
+    return Result.err(new DecodeError({ message: "UnsatisfiedGate reason must be string" }));
+  }
+
+  return Result.ok({
+    gate: gateResult.value,
+    result: decodedResult,
+    reason,
+  });
+}
+
+/**
+ * Decode gate output (string | null) from CLI JSON
+ */
+export function decodeGateOutput(v: unknown): Result<string | null, DecodeError> {
+  if (v === null) return Result.ok(null);
+  if (isString(v)) return Result.ok(v);
+  return Result.err(new DecodeError({ message: `Gate output must be string or null, got ${typeof v}` }));
+}
+
+/**
+ * Decode UnsatisfiedGate array
+ */
+export function decodeUnsatisfiedGates(v: unknown): Result<UnsatisfiedGate[], DecodeError> {
+  if (!Array.isArray(v)) {
+    return Result.err(new DecodeError({ message: "UnsatisfiedGates must be array" }));
+  }
+
+  const items: UnsatisfiedGate[] = [];
+  for (let i = 0; i < v.length; i++) {
+    const result = decodeUnsatisfiedGate(v[i]);
+    if (result.isErr()) {
+      return Result.err(new DecodeError({ message: result.error.message, path: `unsatisfied[${i}]` }));
+    }
+    items.push(result.value);
+  }
+  return Result.ok(items);
 }

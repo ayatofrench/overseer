@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::db::learning_repo::Learning;
-use crate::id::TaskId;
+use crate::id::{GateId, TaskId};
 
 /// Task lifecycle state - computed from field values
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +73,9 @@ pub struct Task {
     /// Computed field: true if task or any ancestor has incomplete blockers
     #[serde(default)]
     pub effectively_blocked: bool,
+    /// Arbitrary JSON metadata stored in task_metadata table
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub cancelled: bool,
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -171,6 +174,157 @@ pub struct ListTasksFilter {
     /// - Some(true): only archived
     /// - Some(false): hide archived (default)
     pub archived: Option<bool>,
+}
+
+// ============ Gate Types ============
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateType {
+    Shell,
+    Metadata,
+    Manual,
+}
+
+impl std::fmt::Display for GateType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateType::Shell => write!(f, "shell"),
+            GateType::Metadata => write!(f, "metadata"),
+            GateType::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+impl std::str::FromStr for GateType {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "shell" => Ok(GateType::Shell),
+            "metadata" => Ok(GateType::Metadata),
+            "manual" => Ok(GateType::Manual),
+            _ => Err(format!("Invalid gate type: {s} (expected shell, metadata, or manual)")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateStatus {
+    Pending,
+    Running,
+    Pass,
+    Fail,
+    Error,
+    Skip,
+}
+
+impl std::fmt::Display for GateStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateStatus::Pending => write!(f, "pending"),
+            GateStatus::Running => write!(f, "running"),
+            GateStatus::Pass => write!(f, "pass"),
+            GateStatus::Fail => write!(f, "fail"),
+            GateStatus::Error => write!(f, "error"),
+            GateStatus::Skip => write!(f, "skip"),
+        }
+    }
+}
+
+impl std::str::FromStr for GateStatus {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(GateStatus::Pending),
+            "running" => Ok(GateStatus::Running),
+            "pass" => Ok(GateStatus::Pass),
+            "fail" => Ok(GateStatus::Fail),
+            "error" => Ok(GateStatus::Error),
+            "skip" => Ok(GateStatus::Skip),
+            _ => Err(format!("Invalid gate status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Gate {
+    pub id: GateId,
+    pub task_id: Option<TaskId>,
+    pub name: String,
+    pub description: String,
+    pub gate_type: GateType,
+    pub config: serde_json::Value,
+    pub required: bool,
+    pub applies_to: String,
+    pub depth_filter: Option<i32>,
+    pub ordering: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateResult {
+    pub gate_id: GateId,
+    pub task_id: TaskId,
+    pub status: GateStatus,
+    pub output: Option<String>,
+    pub exit_code: Option<i32>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifiedBy {
+    Overseer,
+    External,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateStatusEntry {
+    pub gate: Gate,
+    pub result: Option<GateResult>,
+    pub satisfied: bool,
+    pub verified_by: VerifiedBy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateStatusReport {
+    pub task_id: TaskId,
+    pub running: bool,
+    pub gates: Vec<GateStatusEntry>,
+    pub can_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsatisfiedGate {
+    pub gate: Gate,
+    pub result: Option<GateResult>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateGateInput {
+    pub name: String,
+    pub description: String,
+    pub gate_type: String,
+    pub task_id: Option<TaskId>,
+    pub config: Option<serde_json::Value>,
+    pub required: Option<bool>,
+    pub depth_filter: Option<i32>,
+    pub ordering: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GateFilter {
+    pub task_id: Option<TaskId>,
+    pub project_only: bool,
 }
 
 impl Default for ListTasksFilter {

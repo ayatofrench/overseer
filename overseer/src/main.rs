@@ -18,8 +18,8 @@ mod vcs;
 mod testutil;
 
 use commands::{
-    data, learning, task, vcs as vcs_cmd, DataCommand, DataResult, LearningCommand, LearningResult,
-    TaskCommand, TaskResult, VcsCommand,
+    data, gate, learning, task, vcs as vcs_cmd, DataCommand, DataResult, GateCommand,
+    GateResultType, LearningCommand, LearningResult, TaskCommand, TaskResult, VcsCommand,
 };
 use output::Printer;
 
@@ -72,6 +72,10 @@ enum Command {
     /// VCS operations (detect, status, log, diff, commit)
     #[command(subcommand)]
     Vcs(VcsCommand),
+
+    /// Quality gates (definitions, execution, enforcement)
+    #[command(subcommand)]
+    Gate(GateCommand),
 
     /// Data import/export
     #[command(subcommand)]
@@ -362,7 +366,7 @@ fn run(command: &Command, db_path: &PathBuf) -> error::Result<String> {
             // Only workflow commands (start/complete) require VCS
             // Delete is best-effort VCS cleanup (works without VCS)
             let result = match &cloned_cmd {
-                TaskCommand::Start { .. } | TaskCommand::Complete(_) => {
+                TaskCommand::Start(_) | TaskCommand::Complete(_) => {
                     let vcs = vcs::get_backend(&std::env::current_dir().unwrap_or_default())?;
                     task::handle_workflow(&conn, cloned_cmd, vcs)?
                 }
@@ -383,6 +387,30 @@ fn run(command: &Command, db_path: &PathBuf) -> error::Result<String> {
                 TaskResult::Tree(tree) => Ok(serde_json::to_string_pretty(&tree)?),
                 TaskResult::Trees(trees) => Ok(serde_json::to_string_pretty(&trees)?),
                 TaskResult::Progress(progress) => Ok(serde_json::to_string_pretty(&progress)?),
+                TaskResult::Metadata(meta) => Ok(serde_json::to_string_pretty(&meta)?),
+            }
+        }
+        Command::Gate(cmd) => {
+            let conn = db::open_db(db_path)?;
+            let cloned_cmd = clone_gate_cmd(cmd);
+
+            let result = match &cloned_cmd {
+                GateCommand::Run(_) => {
+                    let vcs_backend =
+                        vcs::get_backend(&std::env::current_dir().unwrap_or_default())?;
+                    gate::handle_workflow(&conn, cloned_cmd, vcs_backend)?
+                }
+                _ => gate::handle(&conn, cloned_cmd)?,
+            };
+
+            match result {
+                GateResultType::Gate(g) => Ok(serde_json::to_string_pretty(&g)?),
+                GateResultType::Gates(gs) => Ok(serde_json::to_string_pretty(&gs)?),
+                GateResultType::GateResult(r) => Ok(serde_json::to_string_pretty(&r)?),
+                GateResultType::Status(s) => Ok(serde_json::to_string_pretty(&s)?),
+                GateResultType::Unsatisfied(u) => Ok(serde_json::to_string_pretty(&u)?),
+                GateResultType::Output(o) => Ok(serde_json::to_string_pretty(&o)?),
+                GateResultType::Deleted => Ok(serde_json::json!({ "deleted": true }).to_string()),
             }
         }
         Command::Learning(cmd) => {
@@ -463,11 +491,16 @@ fn clone_task_cmd(cmd: &TaskCommand) -> TaskCommand {
             priority: args.priority,
             parent: args.parent.clone(),
         }),
-        TaskCommand::Start { id } => TaskCommand::Start { id: id.clone() },
+        TaskCommand::Start(args) => TaskCommand::Start(task::StartArgs {
+            id: args.id.clone(),
+            bookmark: args.bookmark.clone(),
+            workspace: args.workspace.clone(),
+        }),
         TaskCommand::Complete(args) => TaskCommand::Complete(task::CompleteArgs {
             id: args.id.clone(),
             result: args.result.clone(),
             learnings: args.learnings.clone(),
+            force: args.force,
         }),
         TaskCommand::Reopen { id } => TaskCommand::Reopen { id: id.clone() },
         TaskCommand::Cancel { id } => TaskCommand::Cancel { id: id.clone() },
@@ -492,6 +525,16 @@ fn clone_task_cmd(cmd: &TaskCommand) -> TaskCommand {
         }),
         TaskCommand::Progress(args) => TaskCommand::Progress(task::ProgressArgs {
             id: args.id.clone(),
+        }),
+        TaskCommand::Metadata(subcmd) => TaskCommand::Metadata(match subcmd {
+            task::MetadataCommand::Get { id } => task::MetadataCommand::Get { id: id.clone() },
+            task::MetadataCommand::Set { id, data } => task::MetadataCommand::Set {
+                id: id.clone(),
+                data: data.clone(),
+            },
+            task::MetadataCommand::Delete { id } => {
+                task::MetadataCommand::Delete { id: id.clone() }
+            }
         }),
     }
 }
@@ -529,6 +572,50 @@ fn clone_vcs_cmd(cmd: &VcsCommand) -> VcsCommand {
 fn clone_cleanup_args(args: &vcs_cmd::CleanupArgs) -> vcs_cmd::CleanupArgs {
     vcs_cmd::CleanupArgs {
         delete: args.delete,
+    }
+}
+
+fn clone_gate_cmd(cmd: &GateCommand) -> GateCommand {
+    match cmd {
+        GateCommand::Add(args) => GateCommand::Add(gate::AddArgs {
+            name: args.name.clone(),
+            gate_type: args.gate_type.clone(),
+            task: args.task.clone(),
+            config: args.config.clone(),
+            required: args.required,
+            depth: args.depth,
+            order: args.order,
+            description: args.description.clone(),
+        }),
+        GateCommand::List(args) => GateCommand::List(gate::ListGateArgs {
+            task: args.task.clone(),
+            project: args.project,
+        }),
+        GateCommand::Delete { id } => GateCommand::Delete { id: id.clone() },
+        GateCommand::Run(args) => GateCommand::Run(gate::RunArgs {
+            task_id: args.task_id.clone(),
+            gate: args.gate.clone(),
+        }),
+        GateCommand::Status { task_id } => GateCommand::Status {
+            task_id: task_id.clone(),
+        },
+        GateCommand::Output(args) => GateCommand::Output(gate::OutputArgs {
+            task_id: args.task_id.clone(),
+            gate_id: args.gate_id.clone(),
+        }),
+        GateCommand::Pass(args) => GateCommand::Pass(gate::PassFailArgs {
+            task_id: args.task_id.clone(),
+            gate_id: args.gate_id.clone(),
+            output: args.output.clone(),
+        }),
+        GateCommand::Fail(args) => GateCommand::Fail(gate::PassFailArgs {
+            task_id: args.task_id.clone(),
+            gate_id: args.gate_id.clone(),
+            output: args.output.clone(),
+        }),
+        GateCommand::Check { task_id } => GateCommand::Check {
+            task_id: task_id.clone(),
+        },
     }
 }
 

@@ -22,10 +22,7 @@ pub enum TaskCommand {
     },
     List(ListArgs),
     Update(UpdateArgs),
-    Start {
-        #[arg(value_parser = parse_task_id)]
-        id: TaskId,
-    },
+    Start(StartArgs),
     Complete(CompleteArgs),
     Reopen {
         #[arg(value_parser = parse_task_id)]
@@ -49,6 +46,30 @@ pub enum TaskCommand {
     Tree(TreeArgs),
     Search(SearchArgs),
     Progress(ProgressArgs),
+    /// Get or set task metadata (arbitrary JSON)
+    #[command(subcommand)]
+    Metadata(MetadataCommand),
+}
+
+#[derive(Subcommand)]
+pub enum MetadataCommand {
+    /// Get metadata for a task
+    Get {
+        #[arg(value_parser = parse_task_id)]
+        id: TaskId,
+    },
+    /// Set (upsert) metadata for a task
+    Set {
+        #[arg(value_parser = parse_task_id)]
+        id: TaskId,
+        /// JSON string to store as metadata
+        data: String,
+    },
+    /// Delete metadata for a task
+    Delete {
+        #[arg(value_parser = parse_task_id)]
+        id: TaskId,
+    },
 }
 
 #[derive(Args)]
@@ -126,6 +147,20 @@ pub struct UpdateArgs {
 }
 
 #[derive(Args)]
+pub struct StartArgs {
+    #[arg(value_parser = parse_task_id)]
+    pub id: TaskId,
+
+    /// Custom bookmark name (default: task/{id})
+    #[arg(long)]
+    pub bookmark: Option<String>,
+
+    /// Create a jj workspace / git worktree at this path instead of checking out in-place
+    #[arg(long)]
+    pub workspace: Option<String>,
+}
+
+#[derive(Args)]
 pub struct CompleteArgs {
     #[arg(value_parser = parse_task_id)]
     pub id: TaskId,
@@ -136,6 +171,10 @@ pub struct CompleteArgs {
     /// Add learnings discovered during this task (repeatable)
     #[arg(long = "learning", action = clap::ArgAction::Append)]
     pub learnings: Vec<String>,
+
+    /// Force completion even if gates are not satisfied
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -189,6 +228,7 @@ pub enum TaskResult {
     Tree(TaskTree),
     Trees(Vec<TaskTree>),
     Progress(TaskProgressResult),
+    Metadata(Option<serde_json::Value>),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -314,8 +354,28 @@ pub fn handle(conn: &Connection, cmd: TaskCommand) -> Result<TaskResult> {
             Ok(TaskResult::Progress(progress))
         }
 
+        TaskCommand::Metadata(subcmd) => {
+            let svc = TaskService::new(conn);
+            match subcmd {
+                MetadataCommand::Get { id } => {
+                    let meta = svc.get_metadata(&id)?;
+                    Ok(TaskResult::Metadata(meta))
+                }
+                MetadataCommand::Set { id, data } => {
+                    let data: serde_json::Value = serde_json::from_str(&data)?;
+                    svc.set_metadata(&id, &data)?;
+                    let meta = svc.get_metadata(&id)?;
+                    Ok(TaskResult::Metadata(meta))
+                }
+                MetadataCommand::Delete { id } => {
+                    svc.delete_metadata(&id)?;
+                    Ok(TaskResult::Deleted)
+                }
+            }
+        }
+
         // Workflow commands require VCS - caller must use handle_workflow
-        TaskCommand::Start { .. } | TaskCommand::Complete(_) => {
+        TaskCommand::Start(_) | TaskCommand::Complete(_) => {
             Err(crate::error::OsError::NotARepository)
         }
     }
@@ -330,13 +390,26 @@ pub fn handle_workflow(
     let workflow = TaskWorkflowService::new(conn, vcs);
 
     match cmd {
-        TaskCommand::Start { id } => Ok(TaskResult::One(workflow.start_follow_blockers(&id)?)),
+        TaskCommand::Start(args) => {
+            if args.bookmark.is_some() || args.workspace.is_some() {
+                Ok(TaskResult::One(workflow.start_with_options(
+                    &args.id,
+                    args.bookmark.as_deref(),
+                    args.workspace.as_deref(),
+                )?))
+            } else {
+                Ok(TaskResult::One(workflow.start_follow_blockers(&args.id)?))
+            }
+        }
 
-        TaskCommand::Complete(args) => Ok(TaskResult::One(workflow.complete_with_learnings(
-            &args.id,
-            args.result.as_deref(),
-            &args.learnings,
-        )?)),
+        TaskCommand::Complete(args) => Ok(TaskResult::One(
+            workflow.complete_with_learnings_force(
+                &args.id,
+                args.result.as_deref(),
+                &args.learnings,
+                args.force,
+            )?,
+        )),
 
         // Non-workflow commands delegate to handle()
         _ => handle(conn, cmd),

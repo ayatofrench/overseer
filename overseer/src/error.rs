@@ -1,6 +1,7 @@
 use thiserror::Error;
 
-use crate::id::{LearningId, TaskId};
+use crate::id::{GateId, LearningId, TaskId};
+use crate::types::UnsatisfiedGate;
 use crate::vcs::VcsError;
 
 /// Reason why a task cannot be started
@@ -112,6 +113,25 @@ pub enum OsError {
     #[error("Invalid priority: {0} (must be 0-2)")]
     InvalidPriority(i32),
 
+    // Gate errors
+    #[error("Gate not found: {0}")]
+    GateNotFound(GateId),
+
+    #[error("Gates not satisfied for task {task_id}")]
+    GatesNotSatisfied {
+        task_id: TaskId,
+        gates: Vec<UnsatisfiedGate>,
+    },
+
+    #[error("Gate {0} is not a manual gate — use `os gate run` instead")]
+    GateNotManual(GateId),
+
+    #[error("Gate run already in progress for task {0}")]
+    GateRunInProgress(TaskId),
+
+    #[error("Invalid gate type: {0}")]
+    InvalidGateType(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -126,6 +146,9 @@ pub enum OsError {
 
     #[error("VCS error: {0}")]
     Vcs(VcsError),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl From<VcsError> for OsError {

@@ -242,6 +242,10 @@ impl Printer {
             Command::Data(DataCommand::Export { .. }) => {
                 self.print_data_export(output);
             }
+            // Gate commands: JSON passthrough (no special pretty-print yet)
+            Command::Gate(_) => {
+                println!("{}", output);
+            }
             // PRECONDITION: Completions handled in main() before print() is called
             Command::Completions { .. } => unreachable!("completions handled before print()"),
             // PRECONDITION: UI and MCP handled in main() before print() is called

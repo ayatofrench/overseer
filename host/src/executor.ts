@@ -4,6 +4,7 @@
 import vm from "node:vm";
 import { tasks } from "./api/tasks.js";
 import { learnings } from "./api/learnings.js";
+import { gates } from "./api/gates.js";
 
 const MAX_OUTPUT_SIZE = 50_000; // chars
 
@@ -20,6 +21,7 @@ export async function execute(code: string): Promise<unknown> {
   const sandbox = {
     tasks,
     learnings,
+    gates,
     console: {
       log: (...args: unknown[]) => console.log("[sandbox]", ...args),
       error: (...args: unknown[]) => console.error("[sandbox]", ...args),

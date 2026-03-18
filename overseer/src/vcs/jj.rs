@@ -373,6 +373,21 @@ impl VcsBackend for JjBackend {
 
         Ok(())
     }
+
+    fn create_workspace(&self, path: &str, name: &str) -> VcsResult<()> {
+        let output = std::process::Command::new("jj")
+            .args(["workspace", "add", path, "--name", name])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|e| VcsError::Jj(format!("spawn jj workspace add: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VcsError::Jj(format!("jj workspace add failed: {stderr}")));
+        }
+
+        Ok(())
+    }
 }
 
 impl JjBackend {

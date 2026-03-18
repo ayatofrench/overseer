@@ -153,10 +153,20 @@ export const tasks = {
    * Creates VCS bookmark for started task and records start commit.
    * Returns the task that was actually started.
    *
+   * Options:
+   * - bookmark: custom bookmark name (default: task/{id})
+   * - workspace: path to create jj workspace / git worktree (isolates work)
+   *
    * **Requires VCS**: Must be in a jj or git repository.
    */
-  async start(id: string): Promise<Task> {
-    return decodeTask(await callCli(["task", "start", id])).unwrap("tasks.start");
+  async start(
+    id: string,
+    options?: { bookmark?: string; workspace?: string }
+  ): Promise<Task> {
+    const args = ["task", "start", id];
+    if (options?.bookmark) args.push("--bookmark", options.bookmark);
+    if (options?.workspace) args.push("--workspace", options.workspace);
+    return decodeTask(await callCli(args)).unwrap("tasks.start");
   },
 
   /**
@@ -270,5 +280,31 @@ export const tasks = {
     const args = ["task", "progress"];
     if (rootId) args.push(rootId);
     return decodeTaskProgress(await callCli(args)).unwrap("tasks.progress");
+  },
+
+  /**
+   * Get metadata for a task.
+   * Returns the metadata object, or null if no metadata is set.
+   */
+  async getMetadata(id: string): Promise<Record<string, unknown> | null> {
+    const result = await callCli(["task", "metadata", "get", id]);
+    return result as Record<string, unknown> | null;
+  },
+
+  /**
+   * Set (upsert) metadata for a task.
+   * Replaces any existing metadata with the provided object.
+   */
+  async setMetadata(id: string, data: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    const json = JSON.stringify(data);
+    const result = await callCli(["task", "metadata", "set", id, json]);
+    return result as Record<string, unknown> | null;
+  },
+
+  /**
+   * Delete metadata for a task.
+   */
+  async deleteMetadata(id: string): Promise<void> {
+    await callCli(["task", "metadata", "delete", id]);
   },
 };

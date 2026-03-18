@@ -135,6 +135,12 @@ pub trait VcsBackend: Send + Sync {
     // Navigation
     fn checkout(&self, target: &str) -> VcsResult<()>;
 
+    // Workspace management
+    /// Create an isolated workspace at the given path.
+    /// For jj: runs `jj workspace add <path> --name <name>`
+    /// For git: runs `git worktree add <path> -b <name>`
+    fn create_workspace(&self, path: &str, name: &str) -> VcsResult<()>;
+
     // Working copy safety
     fn is_clean(&self) -> VcsResult<bool> {
         self.status().map(|s| s.files.is_empty())

@@ -47,6 +47,7 @@ fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         blocked_by: Vec::new(),
         blocks: Vec::new(),
         effectively_blocked: false, // Computed by TaskService
+        metadata: None, // Loaded separately from task_metadata table
         cancelled: row.get::<_, i32>("cancelled")? != 0,
         cancelled_at: row
             .get::<_, Option<String>>("cancelled_at")?
@@ -535,6 +536,48 @@ pub fn is_task_completed(conn: &Connection, id: &TaskId) -> Result<bool> {
 /// but will always return Ok. Missing/errored tasks are treated as not satisfying.
 pub fn is_task_satisfies_blocker(conn: &Connection, id: &TaskId) -> Result<bool> {
     Ok(satisfies_blocker(conn, id))
+}
+
+// --- Metadata operations ---
+
+/// Get metadata JSON for a task. Returns None if no metadata exists.
+pub fn get_metadata(conn: &Connection, id: &TaskId) -> Result<Option<serde_json::Value>> {
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data FROM task_metadata WHERE task_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match data {
+        Some(json_str) => {
+            let val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| OsError::Internal(e.to_string()))?;
+            Ok(Some(val))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Upsert metadata JSON for a task. Replaces any existing metadata.
+pub fn set_metadata(conn: &Connection, id: &TaskId, data: &serde_json::Value) -> Result<()> {
+    let json_str =
+        serde_json::to_string(data).map_err(|e| OsError::Internal(e.to_string()))?;
+    conn.execute(
+        "INSERT INTO task_metadata (task_id, data) VALUES (?1, ?2) ON CONFLICT(task_id) DO UPDATE SET data = ?2",
+        params![id, json_str],
+    )?;
+    Ok(())
+}
+
+/// Delete metadata for a task. No-op if no metadata exists.
+pub fn delete_metadata(conn: &Connection, id: &TaskId) -> Result<()> {
+    conn.execute(
+        "DELETE FROM task_metadata WHERE task_id = ?1",
+        params![id],
+    )?;
+    Ok(())
 }
 
 fn satisfies_blocker(conn: &Connection, id: &TaskId) -> bool {

@@ -454,6 +454,21 @@ impl VcsBackend for GixBackend {
 
         Ok(())
     }
+
+    fn create_workspace(&self, path: &str, name: &str) -> VcsResult<()> {
+        let output = Command::new("git")
+            .args(["worktree", "add", path, "-b", name])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|e| VcsError::Git(format!("spawn git worktree add: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VcsError::Git(format!("git worktree add failed: {stderr}")));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
