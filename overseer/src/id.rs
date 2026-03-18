@@ -169,6 +169,74 @@ impl FromSql for GateId {
     }
 }
 
+// ============ ReviewId ============
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReviewId(String);
+
+impl ReviewId {
+    pub const PREFIX: &'static str = "rev_";
+
+    pub fn new() -> Self {
+        Self(format!("{}{}", Self::PREFIX, ulid::Ulid::new()))
+    }
+
+    pub(crate) fn from_raw_ulid(ulid: String) -> Self {
+        Self(format!("{}{}", Self::PREFIX, ulid))
+    }
+
+    #[allow(dead_code)]
+    pub fn ulid_part(&self) -> &str {
+        self.0.strip_prefix(Self::PREFIX).unwrap_or(&self.0)
+    }
+
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for ReviewId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ReviewId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for ReviewId {
+    type Err = IdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let ulid = s
+            .strip_prefix(Self::PREFIX)
+            .ok_or_else(|| IdParseError::MissingPrefix {
+                expected: Self::PREFIX,
+                actual: s.to_string(),
+            })?;
+        validate_ulid(ulid)?;
+        Ok(Self::from_raw_ulid(ulid.to_string()))
+    }
+}
+
+impl ToSql for ReviewId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.0.clone()))
+    }
+}
+
+impl FromSql for ReviewId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?.to_string();
+        Ok(Self(s))
+    }
+}
+
 // ============ LearningId ============
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

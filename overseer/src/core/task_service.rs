@@ -2,13 +2,13 @@ use std::collections::HashSet;
 
 use rusqlite::Connection;
 
-use crate::db::{self, gate_repo, learning_repo, task_repo};
+use crate::db::{self, gate_repo, learning_repo, review_repo, task_repo};
 use crate::error::{OsError, Result};
-use crate::id::{GateId, TaskId};
+use crate::id::{GateId, ReviewId, TaskId};
 use crate::types::{
     CreateGateInput, CreateTaskInput, Gate, GateFilter, GateResult, GateStatus, GateStatusEntry,
-    GateStatusReport, GateType, InheritedLearnings, LifecycleState, ListTasksFilter, Task,
-    TaskContext, UnsatisfiedGate, UpdateTaskInput, VerifiedBy,
+    GateStatusReport, GateType, InheritedLearnings, LifecycleState, ListTasksFilter, Review,
+    ReviewFilter, ReviewStatus, Task, TaskContext, UnsatisfiedGate, UpdateTaskInput, VerifiedBy,
 };
 use crate::vcs;
 
@@ -1015,6 +1015,129 @@ impl<'a> TaskService<'a> {
     ) -> Result<Option<String>> {
         let result = gate_repo::get_result(self.conn, gate_id, task_id)?;
         Ok(result.and_then(|r| r.output))
+    }
+
+    // ============ Reviews ============
+
+    /// Submit a task for review. Creates a new Review in GatesPending.
+    /// Task must exist and be in-progress. No active review may already exist.
+    pub fn submit_review(&self, task_id: &TaskId) -> Result<Review> {
+        let task = task_repo::get_task(self.conn, task_id)?
+            .ok_or_else(|| OsError::TaskNotFound(task_id.clone()))?;
+
+        if task.lifecycle_state() != LifecycleState::InProgress {
+            return Err(OsError::CannotStartInactive {
+                state: format!("{:?}", task.lifecycle_state()),
+            });
+        }
+
+        // Ensure no active review exists
+        if let Some(_active) = review_repo::get_active_for_task(self.conn, task_id)? {
+            return Err(OsError::ActiveReviewExists(task_id.clone()));
+        }
+
+        review_repo::create_review(self.conn, task_id)
+    }
+
+    pub fn get_review(&self, id: &ReviewId) -> Result<Review> {
+        review_repo::get_review(self.conn, id)?
+            .ok_or_else(|| OsError::ReviewNotFound(id.clone()))
+    }
+
+    pub fn get_active_review(&self, task_id: &TaskId) -> Result<Option<Review>> {
+        review_repo::get_active_for_task(self.conn, task_id)
+    }
+
+    pub fn list_reviews(&self, filter: &ReviewFilter) -> Result<Vec<Review>> {
+        review_repo::list_reviews(self.conn, filter)
+    }
+
+    /// Transition GatesPending -> AgentPending (gates passed)
+    pub fn approve_gates(&self, review_id: &ReviewId) -> Result<Review> {
+        let review = self.get_review(review_id)?;
+        if review.status != ReviewStatus::GatesPending {
+            return Err(OsError::InvalidReviewTransition {
+                from: review.status.to_string(),
+                to: "agent_pending".to_string(),
+            });
+        }
+        review_repo::update_status(self.conn, review_id, ReviewStatus::AgentPending)
+    }
+
+    /// Transition AgentPending -> HumanPending (agent approved)
+    pub fn approve_agent(&self, review_id: &ReviewId) -> Result<Review> {
+        let review = self.get_review(review_id)?;
+        if review.status != ReviewStatus::AgentPending {
+            return Err(OsError::InvalidReviewTransition {
+                from: review.status.to_string(),
+                to: "human_pending".to_string(),
+            });
+        }
+        review_repo::update_status(self.conn, review_id, ReviewStatus::HumanPending)
+    }
+
+    /// Transition HumanPending -> Approved (human approved).
+    /// GATE BRIDGE: passes all manual gates for the task.
+    pub fn approve_human(&self, review_id: &ReviewId) -> Result<Review> {
+        let review = self.get_review(review_id)?;
+        if review.status != ReviewStatus::HumanPending {
+            return Err(OsError::InvalidReviewTransition {
+                from: review.status.to_string(),
+                to: "approved".to_string(),
+            });
+        }
+
+        let result =
+            review_repo::update_status(self.conn, review_id, ReviewStatus::Approved)?;
+
+        // Gate bridge: pass all manual gates for this task
+        self.bridge_manual_gates(&result.task_id, GateStatus::Pass)?;
+
+        Ok(result)
+    }
+
+    /// Transition any active status -> ChangesRequested (terminal).
+    /// GATE BRIDGE: fails all manual gates for the task.
+    pub fn request_changes(&self, review_id: &ReviewId) -> Result<Review> {
+        let review = self.get_review(review_id)?;
+        if !review.status.is_active() {
+            return Err(OsError::InvalidReviewTransition {
+                from: review.status.to_string(),
+                to: "changes_requested".to_string(),
+            });
+        }
+
+        let result = review_repo::update_status(
+            self.conn,
+            review_id,
+            ReviewStatus::ChangesRequested,
+        )?;
+
+        // Gate bridge: fail all manual gates for this task
+        self.bridge_manual_gates(&result.task_id, GateStatus::Fail)?;
+
+        Ok(result)
+    }
+
+    /// Bridge review outcome to manual gates: set all manual gates for the task to the given status.
+    fn bridge_manual_gates(&self, task_id: &TaskId, status: GateStatus) -> Result<()> {
+        let depth = self.get_depth(task_id)?;
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+
+        for gate in gates {
+            if gate.gate_type == GateType::Manual {
+                gate_repo::set_result(
+                    self.conn,
+                    &gate.id,
+                    task_id,
+                    status,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -18,8 +18,9 @@ mod vcs;
 mod testutil;
 
 use commands::{
-    data, gate, learning, task, vcs as vcs_cmd, DataCommand, DataResult, GateCommand,
-    GateResultType, LearningCommand, LearningResult, TaskCommand, TaskResult, VcsCommand,
+    data, gate, learning, review, task, vcs as vcs_cmd, DataCommand, DataResult, GateCommand,
+    GateResultType, LearningCommand, LearningResult, ReviewCommand, ReviewResultType, TaskCommand,
+    TaskResult, VcsCommand,
 };
 use output::Printer;
 
@@ -76,6 +77,10 @@ enum Command {
     /// Quality gates (definitions, execution, enforcement)
     #[command(subcommand)]
     Gate(GateCommand),
+
+    /// Code review pipeline (submit, approve, request changes)
+    #[command(subcommand)]
+    Review(ReviewCommand),
 
     /// Data import/export
     #[command(subcommand)]
@@ -413,6 +418,17 @@ fn run(command: &Command, db_path: &PathBuf) -> error::Result<String> {
                 GateResultType::Deleted => Ok(serde_json::json!({ "deleted": true }).to_string()),
             }
         }
+        Command::Review(cmd) => {
+            let conn = db::open_db(db_path)?;
+            let cloned_cmd = clone_review_cmd(cmd);
+            let result = review::handle(&conn, cloned_cmd)?;
+
+            match result {
+                ReviewResultType::One(r) => Ok(serde_json::to_string_pretty(&r)?),
+                ReviewResultType::MaybeOne(r) => Ok(serde_json::to_string_pretty(&r)?),
+                ReviewResultType::Many(rs) => Ok(serde_json::to_string_pretty(&rs)?),
+            }
+        }
         Command::Learning(cmd) => {
             let conn = db::open_db(db_path)?;
             match learning::handle(&conn, clone_learning_cmd(cmd))? {
@@ -616,6 +632,26 @@ fn clone_gate_cmd(cmd: &GateCommand) -> GateCommand {
         GateCommand::Check { task_id } => GateCommand::Check {
             task_id: task_id.clone(),
         },
+    }
+}
+
+fn clone_review_cmd(cmd: &ReviewCommand) -> ReviewCommand {
+    match cmd {
+        ReviewCommand::Submit { task_id } => ReviewCommand::Submit {
+            task_id: task_id.clone(),
+        },
+        ReviewCommand::Get { id } => ReviewCommand::Get { id: id.clone() },
+        ReviewCommand::Active { task_id } => ReviewCommand::Active {
+            task_id: task_id.clone(),
+        },
+        ReviewCommand::List(args) => ReviewCommand::List(review::ListArgs {
+            task: args.task.clone(),
+            status: args.status.clone(),
+        }),
+        ReviewCommand::ApproveGates { id } => ReviewCommand::ApproveGates { id: id.clone() },
+        ReviewCommand::ApproveAgent { id } => ReviewCommand::ApproveAgent { id: id.clone() },
+        ReviewCommand::ApproveHuman { id } => ReviewCommand::ApproveHuman { id: id.clone() },
+        ReviewCommand::RequestChanges { id } => ReviewCommand::RequestChanges { id: id.clone() },
     }
 }
 

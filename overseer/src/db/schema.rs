@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
     let current_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -94,6 +94,22 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
                 WHERE status IN ('pending', 'running');
             CREATE UNIQUE INDEX IF NOT EXISTS idx_gates_name_scope
                 ON gates(COALESCE(task_id, ''), name);
+
+            CREATE TABLE IF NOT EXISTS reviews (
+                id TEXT PRIMARY KEY CHECK (id LIKE 'rev_%'),
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN (
+                    'gates_pending', 'agent_pending', 'human_pending',
+                    'approved', 'changes_requested'
+                )),
+                submitted_at TEXT NOT NULL,
+                gates_completed_at TEXT,
+                agent_completed_at TEXT,
+                human_completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reviews_task_status ON reviews(task_id, status);
 
             PRAGMA journal_mode = WAL;
             "#,
@@ -221,6 +237,33 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 6)?;
         version = 6;
+    }
+
+    // Migration for version 6 -> 7: Add reviews table
+    if version == 6 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS reviews (
+                id TEXT PRIMARY KEY CHECK (id LIKE 'rev_%'),
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN (
+                    'gates_pending', 'agent_pending', 'human_pending',
+                    'approved', 'changes_requested'
+                )),
+                submitted_at TEXT NOT NULL,
+                gates_completed_at TEXT,
+                agent_completed_at TEXT,
+                human_completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reviews_task_status ON reviews(task_id, status);
+            COMMIT;
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 7)?;
+        version = 7;
     }
 
     // Suppress unused variable warning - version is used for sequential migration chaining

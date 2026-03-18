@@ -1,5 +1,6 @@
 pub mod gate_repo;
 pub mod learning_repo;
+pub mod review_repo;
 pub mod schema;
 pub mod task_repo;
 

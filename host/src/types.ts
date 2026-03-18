@@ -208,6 +208,41 @@ export interface CreateGateInput {
   description?: string;
 }
 
+// ============ Review Types ============
+
+declare const ReviewIdBrand: unique symbol;
+export type ReviewId = string & { readonly [ReviewIdBrand]: never };
+
+export function isReviewId(s: string): s is ReviewId {
+  return s.startsWith("rev_") && s.length === 30; // "rev_" + 26 ULID chars
+}
+
+export function parseReviewId(s: string): ReviewId {
+  if (!isReviewId(s)) {
+    throw new Error(`Invalid ReviewId: ${s}`);
+  }
+  return s;
+}
+
+export type ReviewStatus =
+  | "gates_pending"
+  | "agent_pending"
+  | "human_pending"
+  | "approved"
+  | "changes_requested";
+
+export interface Review {
+  id: ReviewId;
+  taskId: string;
+  status: ReviewStatus;
+  submittedAt: string;
+  gatesCompletedAt: string | null;
+  agentCompletedAt: string | null;
+  humanCompletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /**
  * CLI command errors
  */

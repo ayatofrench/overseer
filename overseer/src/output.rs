@@ -3,7 +3,9 @@ use std::io::IsTerminal;
 use owo_colors::{OwoColorize, Style};
 use serde::Deserialize;
 
-use crate::commands::{learning::LearningCommand, task::TaskCommand, vcs::VcsCommand, DataCommand};
+use crate::commands::{
+    learning::LearningCommand, task::TaskCommand, vcs::VcsCommand, DataCommand,
+};
 use crate::db;
 use crate::id::TaskId;
 use crate::types;
@@ -244,6 +246,10 @@ impl Printer {
             }
             // Gate commands: JSON passthrough (no special pretty-print yet)
             Command::Gate(_) => {
+                println!("{}", output);
+            }
+            // Review commands: JSON passthrough
+            Command::Review(_) => {
                 println!("{}", output);
             }
             // PRECONDITION: Completions handled in main() before print() is called

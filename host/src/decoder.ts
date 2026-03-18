@@ -7,12 +7,14 @@ import {
   isTaskId,
   isLearningId,
   isGateId,
+  isReviewId,
   type Task,
   type TaskWithContext,
   type Learning,
   type TaskId,
   type LearningId,
   type GateId,
+  type ReviewId,
   type Priority,
   type Depth,
   type TaskContext,
@@ -27,6 +29,8 @@ import {
   type GateStatusReport,
   type UnsatisfiedGate,
   type VerifiedBy,
+  type Review,
+  type ReviewStatus,
 } from "./types.js";
 
 /**
@@ -774,4 +778,106 @@ export function decodeUnsatisfiedGates(v: unknown): Result<UnsatisfiedGate[], De
     items.push(result.value);
   }
   return Result.ok(items);
+}
+
+// ============ Review Decoders ============
+
+const REVIEW_STATUSES = new Set([
+  "gates_pending",
+  "agent_pending",
+  "human_pending",
+  "approved",
+  "changes_requested",
+]);
+
+function isReviewStatus(v: unknown): v is ReviewStatus {
+  return isString(v) && REVIEW_STATUSES.has(v);
+}
+
+/**
+ * Decode a Review from unknown JSON
+ */
+export function decodeReview(v: unknown): Result<Review, DecodeError> {
+  if (!isObject(v)) {
+    return Result.err(new DecodeError({ message: "Review must be object" }));
+  }
+
+  const {
+    id,
+    taskId,
+    status,
+    submittedAt,
+    gatesCompletedAt,
+    agentCompletedAt,
+    humanCompletedAt,
+    createdAt,
+    updatedAt,
+  } = v;
+
+  if (!isString(id) || !isReviewId(id)) {
+    return Result.err(new DecodeError({ message: `Invalid review id: ${id}` }));
+  }
+  if (!isString(taskId)) {
+    return Result.err(new DecodeError({ message: "Review taskId must be string" }));
+  }
+  if (!isReviewStatus(status)) {
+    return Result.err(new DecodeError({ message: `Invalid review status: ${status}` }));
+  }
+  if (!isString(submittedAt)) {
+    return Result.err(new DecodeError({ message: "Review submittedAt must be string" }));
+  }
+  if (gatesCompletedAt !== null && !isString(gatesCompletedAt)) {
+    return Result.err(new DecodeError({ message: "Review gatesCompletedAt must be string or null" }));
+  }
+  if (agentCompletedAt !== null && !isString(agentCompletedAt)) {
+    return Result.err(new DecodeError({ message: "Review agentCompletedAt must be string or null" }));
+  }
+  if (humanCompletedAt !== null && !isString(humanCompletedAt)) {
+    return Result.err(new DecodeError({ message: "Review humanCompletedAt must be string or null" }));
+  }
+  if (!isString(createdAt)) {
+    return Result.err(new DecodeError({ message: "Review createdAt must be string" }));
+  }
+  if (!isString(updatedAt)) {
+    return Result.err(new DecodeError({ message: "Review updatedAt must be string" }));
+  }
+
+  return Result.ok({
+    id: id as ReviewId,
+    taskId,
+    status: status as ReviewStatus,
+    submittedAt,
+    gatesCompletedAt: (gatesCompletedAt ?? null) as string | null,
+    agentCompletedAt: (agentCompletedAt ?? null) as string | null,
+    humanCompletedAt: (humanCompletedAt ?? null) as string | null,
+    createdAt,
+    updatedAt,
+  });
+}
+
+/**
+ * Decode a Review array
+ */
+export function decodeReviews(v: unknown): Result<Review[], DecodeError> {
+  if (!Array.isArray(v)) {
+    return Result.err(new DecodeError({ message: "Reviews must be array" }));
+  }
+
+  const reviews: Review[] = [];
+  for (let i = 0; i < v.length; i++) {
+    const result = decodeReview(v[i]);
+    if (result.isErr()) {
+      return Result.err(new DecodeError({ message: result.error.message, path: `reviews[${i}]` }));
+    }
+    reviews.push(result.value);
+  }
+  return Result.ok(reviews);
+}
+
+/**
+ * Decode nullable Review (for active review)
+ */
+export function decodeReviewOrNull(v: unknown): Result<Review | null, DecodeError> {
+  if (v === null) return Result.ok(null);
+  return decodeReview(v);
 }

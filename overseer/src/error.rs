@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::id::{GateId, LearningId, TaskId};
+use crate::id::{GateId, LearningId, ReviewId, TaskId};
 use crate::types::UnsatisfiedGate;
 use crate::vcs::VcsError;
 
@@ -131,6 +131,19 @@ pub enum OsError {
 
     #[error("Invalid gate type: {0}")]
     InvalidGateType(String),
+
+    // Review errors
+    #[error("Review not found: {0}")]
+    ReviewNotFound(ReviewId),
+
+    #[error("Invalid review transition: {from} -> {to}")]
+    InvalidReviewTransition { from: String, to: String },
+
+    #[error("No active review for task {0}")]
+    NoActiveReview(TaskId),
+
+    #[error("Task {0} already has an active review")]
+    ActiveReviewExists(TaskId),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

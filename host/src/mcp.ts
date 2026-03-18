@@ -154,6 +154,30 @@ interface UnsatisfiedGate {
   reason: string;
 }
 
+// Reviews API (3-phase review pipeline: gates -> agent -> human)
+interface Review {
+  id: string;
+  taskId: string;
+  status: "gates_pending" | "agent_pending" | "human_pending" | "approved" | "changes_requested";
+  submittedAt: string;
+  gatesCompletedAt: string | null;
+  agentCompletedAt: string | null;
+  humanCompletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+declare const reviews: {
+  submit(taskId: string): Promise<Review>;                    // Submit for review (GatesPending)
+  get(reviewId: string): Promise<Review>;
+  active(taskId: string): Promise<Review | null>;             // Get active review for task
+  list(filter?: { taskId?: string; status?: string }): Promise<Review[]>;
+  approveGates(reviewId: string): Promise<Review>;            // GatesPending -> AgentPending
+  approveAgent(reviewId: string): Promise<Review>;            // AgentPending -> HumanPending
+  approveHuman(reviewId: string): Promise<Review>;            // HumanPending -> Approved (bridges to gates.pass on manual gates)
+  requestChanges(reviewId: string): Promise<Review>;          // Active -> ChangesRequested (bridges to gates.fail on manual gates)
+};
+
 declare const gates: {
   add(input: {
     name: string;
@@ -256,6 +280,19 @@ const unsatisfied = await gates.check(task.id);
 if (unsatisfied.length === 0) {
   await tasks.complete(task.id, { result: "Done" });
 }
+
+// Submit task for review (3-phase pipeline)
+const review = await reviews.submit(task.id);
+// Phase 1: Gates pass
+const afterGates = await reviews.approveGates(review.id);
+// Phase 2: Agent approves
+const afterAgent = await reviews.approveAgent(afterGates.id);
+// Phase 3: Human approves (bridges to gates.pass on manual gates)
+const approved = await reviews.approveHuman(afterAgent.id);
+
+// Or request changes (terminal, bridges to gates.fail)
+const review2 = await reviews.submit(task.id);
+await reviews.requestChanges(review2.id);
 \`\`\`
 `.trim();
 

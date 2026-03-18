@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::db::learning_repo::Learning;
-use crate::id::{GateId, TaskId};
+use crate::id::{GateId, ReviewId, TaskId};
 
 /// Task lifecycle state - computed from field values
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +325,76 @@ pub struct CreateGateInput {
 pub struct GateFilter {
     pub task_id: Option<TaskId>,
     pub project_only: bool,
+}
+
+// ============ Review Types ============
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    GatesPending,
+    AgentPending,
+    HumanPending,
+    Approved,
+    ChangesRequested,
+}
+
+impl ReviewStatus {
+    /// Active statuses (not terminal)
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            ReviewStatus::GatesPending | ReviewStatus::AgentPending | ReviewStatus::HumanPending
+        )
+    }
+}
+
+impl std::fmt::Display for ReviewStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReviewStatus::GatesPending => write!(f, "gates_pending"),
+            ReviewStatus::AgentPending => write!(f, "agent_pending"),
+            ReviewStatus::HumanPending => write!(f, "human_pending"),
+            ReviewStatus::Approved => write!(f, "approved"),
+            ReviewStatus::ChangesRequested => write!(f, "changes_requested"),
+        }
+    }
+}
+
+impl std::str::FromStr for ReviewStatus {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "gates_pending" => Ok(ReviewStatus::GatesPending),
+            "agent_pending" => Ok(ReviewStatus::AgentPending),
+            "human_pending" => Ok(ReviewStatus::HumanPending),
+            "approved" => Ok(ReviewStatus::Approved),
+            "changes_requested" => Ok(ReviewStatus::ChangesRequested),
+            _ => Err(format!(
+                "Invalid review status: {s} (expected gates_pending, agent_pending, human_pending, approved, or changes_requested)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Review {
+    pub id: ReviewId,
+    pub task_id: TaskId,
+    pub status: ReviewStatus,
+    pub submitted_at: DateTime<Utc>,
+    pub gates_completed_at: Option<DateTime<Utc>>,
+    pub agent_completed_at: Option<DateTime<Utc>>,
+    pub human_completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReviewFilter {
+    pub task_id: Option<TaskId>,
+    pub status: Option<ReviewStatus>,
 }
 
 impl Default for ListTasksFilter {
