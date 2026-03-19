@@ -40,9 +40,6 @@ fn row_to_gate(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
         description: row.get("description")?,
         gate_type: parse_gate_type(&gate_type_str),
         config: serde_json::from_str(&config_str).unwrap_or(serde_json::json!({})),
-        command: row.get("command")?,
-        timeout_secs: row.get("timeout_secs")?,
-        max_retries: row.get::<_, i32>("max_retries").unwrap_or(1),
         required: row.get::<_, i32>("required")? != 0,
         applies_to: row.get("applies_to")?,
         depth_filter: row.get("depth_filter")?,
@@ -96,11 +93,10 @@ pub fn create_gate(conn: &Connection, input: &CreateGateInput) -> Result<Gate> {
         .unwrap_or_else(|| "{}".to_string());
     let required = input.required.unwrap_or(true) as i32;
     let ordering = input.ordering.unwrap_or(0);
-    let max_retries = input.max_retries.unwrap_or(1);
 
     conn.execute(
-        "INSERT INTO gates (id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'complete', ?11, ?12, ?13)",
+        "INSERT INTO gates (id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'complete', ?8, ?9, ?10)",
         params![
             id,
             input.task_id,
@@ -108,9 +104,6 @@ pub fn create_gate(conn: &Connection, input: &CreateGateInput) -> Result<Gate> {
             input.description,
             gate_type,
             config,
-            input.command,
-            input.timeout_secs,
-            max_retries,
             required,
             input.depth_filter,
             ordering,
@@ -123,7 +116,7 @@ pub fn create_gate(conn: &Connection, input: &CreateGateInput) -> Result<Gate> {
 
 pub fn get_gate(conn: &Connection, id: &GateId) -> Result<Option<Gate>> {
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
+        "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
          FROM gates WHERE id = ?1",
     )?;
 
@@ -134,19 +127,19 @@ pub fn get_gate(conn: &Connection, id: &GateId) -> Result<Option<Gate>> {
 pub fn list_gates(conn: &Connection, filter: &GateFilter) -> Result<Vec<Gate>> {
     let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if filter.project_only {
         (
-            "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
+            "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
              FROM gates WHERE task_id IS NULL ORDER BY ordering, name".to_string(),
             vec![],
         )
     } else if let Some(ref task_id) = filter.task_id {
         (
-            "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
+            "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
              FROM gates WHERE task_id = ?1 ORDER BY ordering, name".to_string(),
             vec![Box::new(task_id.clone())],
         )
     } else {
         (
-            "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
+            "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
              FROM gates ORDER BY ordering, name".to_string(),
             vec![],
         )
@@ -178,7 +171,7 @@ pub fn resolve_gates(
 ) -> Result<Vec<Gate>> {
     // Project-level gates matching depth and transition
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
+        "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
          FROM gates
          WHERE task_id IS NULL
            AND applies_to = ?1
@@ -191,7 +184,7 @@ pub fn resolve_gates(
 
     // Task-specific gates
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
+        "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
          FROM gates
          WHERE task_id = ?1
            AND applies_to = ?2

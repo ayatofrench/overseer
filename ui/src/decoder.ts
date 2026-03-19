@@ -530,8 +530,6 @@ export function decodeGate(v: unknown): Result<Gate, DecodeError> {
     return Result.err(new DecodeError({ message: "Gate createdAt must be string" }));
   }
 
-  const { command, timeoutSecs, maxRetries } = v;
-
   const gate: Gate = {
     id: id as GateId,
     taskId: (taskId ?? null) as string | null,
@@ -539,16 +537,12 @@ export function decodeGate(v: unknown): Result<Gate, DecodeError> {
     description,
     gateType: gateType as GateType,
     config: config as Record<string, unknown>,
-    maxRetries: isNumber(maxRetries) ? maxRetries : 1,
     required,
     appliesTo,
     depthFilter: (depthFilter ?? null) as number | null,
     ordering,
     createdAt,
   };
-
-  if (isString(command)) gate.command = command;
-  if (isNumber(timeoutSecs)) gate.timeoutSecs = timeoutSecs;
 
   return Result.ok(gate);
 }

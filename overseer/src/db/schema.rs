@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
     let current_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -68,9 +68,6 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
                 description TEXT NOT NULL DEFAULT '',
                 gate_type TEXT NOT NULL CHECK (gate_type IN ('shell', 'metadata', 'manual')),
                 config TEXT NOT NULL DEFAULT '{}',
-                command TEXT,
-                timeout_secs INTEGER,
-                max_retries INTEGER NOT NULL DEFAULT 1,
                 required INTEGER NOT NULL DEFAULT 1,
                 applies_to TEXT NOT NULL DEFAULT 'complete' CHECK (applies_to IN ('complete')),
                 depth_filter INTEGER CHECK (depth_filter BETWEEN 0 AND 2),
@@ -309,6 +306,62 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 8)?;
         version = 8;
+    }
+
+    // Migration for version 8 -> 9: Remove promoted gate fields (command, timeout_secs, max_retries)
+    // Merge non-default values into the config JSON blob, then rebuild gates table.
+    if version == 8 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE gates_v9 (
+                id TEXT PRIMARY KEY CHECK (id LIKE 'gate_%'),
+                task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                gate_type TEXT NOT NULL CHECK (gate_type IN ('shell', 'metadata', 'manual')),
+                config TEXT NOT NULL DEFAULT '{}',
+                required INTEGER NOT NULL DEFAULT 1,
+                applies_to TEXT NOT NULL DEFAULT 'complete' CHECK (applies_to IN ('complete')),
+                depth_filter INTEGER CHECK (depth_filter BETWEEN 0 AND 2),
+                ordering INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            INSERT INTO gates_v9 (id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at)
+            SELECT
+                id, task_id, name, description, gate_type,
+                CASE WHEN command IS NOT NULL
+                    THEN json_set(
+                        CASE WHEN timeout_secs IS NOT NULL
+                            THEN json_set(
+                                CASE WHEN max_retries != 1 THEN json_set(config, '$.max_retries', max_retries) ELSE config END,
+                                '$.timeout_secs', timeout_secs)
+                            ELSE CASE WHEN max_retries != 1 THEN json_set(config, '$.max_retries', max_retries) ELSE config END
+                        END,
+                        '$.command', command)
+                    ELSE
+                        CASE WHEN timeout_secs IS NOT NULL
+                            THEN json_set(
+                                CASE WHEN max_retries != 1 THEN json_set(config, '$.max_retries', max_retries) ELSE config END,
+                                '$.timeout_secs', timeout_secs)
+                            ELSE CASE WHEN max_retries != 1 THEN json_set(config, '$.max_retries', max_retries) ELSE config END
+                        END
+                END,
+                required, applies_to, depth_filter, ordering, created_at
+            FROM gates;
+
+            DROP TABLE gates;
+            ALTER TABLE gates_v9 RENAME TO gates;
+
+            CREATE INDEX IF NOT EXISTS idx_gates_task ON gates(task_id);
+            CREATE INDEX IF NOT EXISTS idx_gates_project ON gates(task_id) WHERE task_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gates_name_scope ON gates(COALESCE(task_id, ''), name);
+            COMMIT;
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 9)?;
+        version = 9;
     }
 
     // Suppress unused variable warning - version is used for sequential migration chaining

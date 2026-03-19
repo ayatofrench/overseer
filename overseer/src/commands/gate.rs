@@ -154,21 +154,30 @@ pub fn handle(conn: &Connection, cmd: GateCommand) -> Result<GateResultType> {
 
     match cmd {
         GateCommand::Add(args) => {
-            let config = args
+            let mut config: serde_json::Value = args
                 .config
                 .map(|c| serde_json::from_str(&c))
                 .transpose()
-                .map_err(|e| crate::error::OsError::Json(e))?;
+                .map_err(|e| crate::error::OsError::Json(e))?
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            // Merge convenience CLI args into config JSON
+            if let Some(cmd) = args.command {
+                config["command"] = serde_json::Value::String(cmd);
+            }
+            if let Some(timeout) = args.timeout {
+                config["timeout_secs"] = serde_json::Value::Number(timeout.into());
+            }
+            if let Some(retries) = args.max_retries {
+                config["max_retries"] = serde_json::Value::Number(retries.into());
+            }
 
             let input = CreateGateInput {
                 name: args.name,
                 description: args.description.unwrap_or_default(),
                 gate_type: args.gate_type,
                 task_id: args.task,
-                config,
-                command: args.command,
-                timeout_secs: args.timeout,
-                max_retries: args.max_retries,
+                config: Some(config),
                 required: args.required,
                 depth_filter: args.depth,
                 ordering: args.order,

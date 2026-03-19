@@ -256,11 +256,6 @@ pub struct Gate {
     pub description: String,
     pub gate_type: GateType,
     pub config: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<i64>,
-    pub max_retries: i32,
     pub required: bool,
     pub applies_to: String,
     pub depth_filter: Option<i32>,
@@ -324,9 +319,6 @@ pub struct CreateGateInput {
     pub gate_type: String,
     pub task_id: Option<TaskId>,
     pub config: Option<serde_json::Value>,
-    pub command: Option<String>,
-    pub timeout_secs: Option<i64>,
-    pub max_retries: Option<i32>,
     pub required: Option<bool>,
     pub depth_filter: Option<i32>,
     pub ordering: Option<i32>,

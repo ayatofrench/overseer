@@ -913,14 +913,16 @@ impl Printer {
             if !gate.description.is_empty() {
                 println!("  Description: {}", gate.description);
             }
-            if let Some(ref cmd) = gate.command {
+            if let Some(cmd) = gate.config.get("command").and_then(|v| v.as_str()) {
                 println!("  Command: {}", cmd);
             }
-            if let Some(timeout) = gate.timeout_secs {
+            if let Some(timeout) = gate.config.get("timeout_secs").and_then(|v| v.as_u64()) {
                 println!("  Timeout: {}s", timeout);
             }
-            if gate.max_retries > 1 {
-                println!("  Retries: {}", gate.max_retries);
+            if let Some(retries) = gate.config.get("max_retries").and_then(|v| v.as_i64()) {
+                if retries > 1 {
+                    println!("  Retries: {}", retries);
+                }
             }
             println!(
                 "  Required: {}",
@@ -962,20 +964,22 @@ impl Printer {
                     };
                     let req = if gate.required { "*" } else { " " };
                     let mut details = vec![gate.gate_type.to_string()];
-                    if let Some(ref cmd) = gate.command {
+                    if let Some(cmd) = gate.config.get("command").and_then(|v| v.as_str()) {
                         // Truncate long commands
                         let display_cmd = if cmd.len() > 40 {
                             format!("{}...", &cmd[..37])
                         } else {
-                            cmd.clone()
+                            cmd.to_string()
                         };
                         details.push(format!("cmd={}", display_cmd));
                     }
-                    if let Some(timeout) = gate.timeout_secs {
+                    if let Some(timeout) = gate.config.get("timeout_secs").and_then(|v| v.as_u64()) {
                         details.push(format!("{}s", timeout));
                     }
-                    if gate.max_retries > 1 {
-                        details.push(format!("retries={}", gate.max_retries));
+                    if let Some(retries) = gate.config.get("max_retries").and_then(|v| v.as_i64()) {
+                        if retries > 1 {
+                            details.push(format!("retries={}", retries));
+                        }
                     }
                     println!(
                         "  {}{} {} [{}] ({})",
@@ -1025,10 +1029,11 @@ impl Printer {
 
                     // Show attempt/retries if relevant
                     if let Some(ref result) = entry.result {
-                        if result.attempt > 1 || entry.gate.max_retries > 1 {
+                        let max_retries = entry.gate.config.get("max_retries").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                        if result.attempt > 1 || max_retries > 1 {
                             print!(
                                 " (attempt {}/{})",
-                                result.attempt, entry.gate.max_retries
+                                result.attempt, max_retries
                             );
                         }
                         if let Some(ref review_id) = result.review_id {
@@ -1113,10 +1118,11 @@ impl Printer {
                         u.reason
                     );
                     if let Some(ref result) = u.result {
-                        if result.attempt > 1 || u.gate.max_retries > 1 {
+                        let max_retries = u.gate.config.get("max_retries").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                        if result.attempt > 1 || max_retries > 1 {
                             print!(
                                 " (attempt {}/{})",
-                                result.attempt, u.gate.max_retries
+                                result.attempt, max_retries
                             );
                         }
                     }

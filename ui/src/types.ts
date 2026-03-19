@@ -161,9 +161,6 @@ export interface Gate {
   description: string;
   gateType: GateType;
   config: Record<string, unknown>;
-  command?: string;
-  timeoutSecs?: number;
-  maxRetries: number;
   required: boolean;
   appliesTo: string;
   depthFilter: number | null;

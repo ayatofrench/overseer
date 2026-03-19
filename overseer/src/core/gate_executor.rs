@@ -103,7 +103,13 @@ impl<'a> GateExecutor<'a> {
         commit_sha: Option<&str>,
         review_id: Option<&ReviewId>,
     ) -> Result<GateResult> {
-        let max_retries = gate.max_retries.max(1);
+        let max_retries = gate
+            .config
+            .get("max_retries")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(1)
+            .max(1);
         let mut last_result = None;
 
         for attempt in 1..=max_retries {
@@ -136,16 +142,15 @@ impl<'a> GateExecutor<'a> {
         task_id: &TaskId,
         attempt: i32,
     ) -> (GateStatus, String, Option<i32>) {
-        // Promoted fields take precedence over config JSON
         let command = gate
-            .command
-            .as_deref()
-            .or_else(|| gate.config.get("command").and_then(|v| v.as_str()))
+            .config
+            .get("command")
+            .and_then(|v| v.as_str())
             .unwrap_or("echo 'no command configured'");
         let timeout_secs = gate
-            .timeout_secs
-            .map(|t| t as u64)
-            .or_else(|| gate.config.get("timeout_secs").and_then(|v| v.as_u64()))
+            .config
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
             .unwrap_or(300);
 
         let resolved_command = self.resolve_templates(command, task_id);

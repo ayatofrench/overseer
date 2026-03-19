@@ -792,7 +792,7 @@ function GateStatusSection({ report }: { report: GateStatusReport }) {
         const status = entry.result?.status ?? "pending";
         const icon = gateStatusIcon[status];
         const attempt = entry.result?.attempt ?? 0;
-        const maxRetries = entry.gate.maxRetries;
+        const maxRetries = (entry.gate.config.maxRetries as number | undefined) ?? 1;
 
         return (
           <li
