@@ -159,6 +159,9 @@ export interface Gate {
   description: string;
   gateType: GateType;
   config: Record<string, unknown>;
+  command?: string;
+  timeoutSecs?: number;
+  maxRetries: number;
   required: boolean;
   appliesTo: string;
   depthFilter: number | null;
@@ -175,6 +178,8 @@ export interface GateResult {
   startedAt: string;
   completedAt: string | null;
   commitSha: string | null;
+  reviewId?: string;
+  attempt: number;
 }
 
 export interface GateStatusEntry {
@@ -202,6 +207,9 @@ export interface CreateGateInput {
   type: GateType;
   taskId?: string;
   config?: Record<string, unknown>;
+  command?: string;
+  timeoutSecs?: number;
+  maxRetries?: number;
   required?: boolean;
   depthFilter?: 0 | 1 | 2;
   ordering?: number;

@@ -34,6 +34,9 @@ export const gates = {
     if (input.depthFilter !== undefined) args.push("--depth", String(input.depthFilter));
     if (input.ordering !== undefined) args.push("--order", String(input.ordering));
     if (input.description) args.push("--description", input.description);
+    if (input.command) args.push("--command", input.command);
+    if (input.timeoutSecs !== undefined) args.push("--timeout", String(input.timeoutSecs));
+    if (input.maxRetries !== undefined) args.push("--max-retries", String(input.maxRetries));
     return decodeGate(await callCli(args)).unwrap("gates.add");
   },
 

@@ -557,19 +557,27 @@ export function decodeGate(v: unknown): Result<Gate, DecodeError> {
     return Result.err(new DecodeError({ message: "Gate createdAt must be string" }));
   }
 
-  return Result.ok({
+  const { command, timeoutSecs, maxRetries } = v;
+
+  const gate: Gate = {
     id: id as GateId,
     taskId: (taskId ?? null) as string | null,
     name,
     description,
     gateType: gateType as GateType,
     config: config as Record<string, unknown>,
+    maxRetries: isNumber(maxRetries) ? maxRetries : 1,
     required,
     appliesTo,
     depthFilter: (depthFilter ?? null) as number | null,
     ordering,
     createdAt,
-  });
+  };
+
+  if (isString(command)) gate.command = command;
+  if (isNumber(timeoutSecs)) gate.timeoutSecs = timeoutSecs;
+
+  return Result.ok(gate);
 }
 
 /**
@@ -599,7 +607,7 @@ export function decodeGateResult(v: unknown): Result<GateResult, DecodeError> {
     return Result.err(new DecodeError({ message: "GateResult must be object" }));
   }
 
-  const { gateId, taskId, status, output, exitCode, startedAt, completedAt, commitSha } = v;
+  const { gateId, taskId, status, output, exitCode, startedAt, completedAt, commitSha, reviewId, attempt } = v;
 
   if (!isString(gateId) || !isGateId(gateId)) {
     return Result.err(new DecodeError({ message: `Invalid gate result gateId: ${gateId}` }));
@@ -626,7 +634,7 @@ export function decodeGateResult(v: unknown): Result<GateResult, DecodeError> {
     return Result.err(new DecodeError({ message: "GateResult commitSha must be string or null" }));
   }
 
-  return Result.ok({
+  const result: GateResult = {
     gateId: gateId as GateId,
     taskId: taskId as string,
     status: status as GateStatus,
@@ -635,7 +643,12 @@ export function decodeGateResult(v: unknown): Result<GateResult, DecodeError> {
     startedAt,
     completedAt: (completedAt ?? null) as string | null,
     commitSha: (commitSha ?? null) as string | null,
-  });
+    attempt: isNumber(attempt) ? attempt : 1,
+  };
+
+  if (isString(reviewId) && reviewId.length > 0) result.reviewId = reviewId;
+
+  return Result.ok(result);
 }
 
 /**

@@ -116,6 +116,9 @@ interface Gate {
   description: string;
   gateType: "shell" | "metadata" | "manual";
   config: Record<string, unknown>;
+  command?: string;
+  timeoutSecs?: number;
+  maxRetries: number;
   required: boolean;
   appliesTo: string;
   depthFilter: number | null;
@@ -132,6 +135,8 @@ interface GateResult {
   startedAt: string;
   completedAt: string | null;
   commitSha: string | null;
+  reviewId?: string;
+  attempt: number;
 }
 
 interface GateStatusEntry {
@@ -184,6 +189,9 @@ declare const gates: {
     type: "shell" | "metadata" | "manual";
     taskId?: string;          // omit for project-level
     config?: Record<string, unknown>;
+    command?: string;
+    timeoutSecs?: number;
+    maxRetries?: number;
     required?: boolean;       // default: true
     depthFilter?: 0 | 1 | 2;
     ordering?: number;
