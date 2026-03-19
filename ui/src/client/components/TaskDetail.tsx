@@ -7,6 +7,8 @@ import {
   useCancelTask,
   useArchiveTask,
   useLearnings,
+  useGateStatus,
+  useActiveReview,
 } from "../lib/queries.js";
 import { useKeyboardShortcuts } from "../lib/keyboard.js";
 import { useKeyboardScope } from "../lib/use-keyboard-scope.js";
@@ -21,7 +23,17 @@ import {
 import { Button } from "./ui/Button.js";
 import { Textarea } from "./ui/Textarea.js";
 import { Kbd } from "./ui/Kbd.js";
-import type { TaskWithContext, TaskId, Learning, Priority } from "../../types.js";
+import type {
+  TaskWithContext,
+  TaskId,
+  Learning,
+  Priority,
+  GateStatusEntry,
+  GateStatusReport,
+  GateStatus,
+  Review,
+  ReviewStatus,
+} from "../../types.js";
 
 interface TaskDetailProps {
   task: TaskWithContext;
@@ -83,6 +95,8 @@ export function TaskDetail({ task, onDeleted }: TaskDetailProps) {
 
   const scopeProps = useKeyboardScope("detail");
   const { data: learnings } = useLearnings(task.id);
+  const { data: gateStatus } = useGateStatus(task.id);
+  const { data: activeReview } = useActiveReview(task.id);
   const updateTask = useUpdateTask();
   const completeTask = useCompleteTask();
   const deleteTask = useDeleteTask();
@@ -489,6 +503,29 @@ export function TaskDetail({ task, onDeleted }: TaskDetailProps) {
           </div>
         )}
 
+        {/* Gate Status */}
+        {gateStatus && gateStatus.gates.length > 0 && (
+          <div className={`${container()} col-span-2`}>
+            <dt className={label()}>
+              Gates
+              <GatesSummaryBadge report={gateStatus} />
+            </dt>
+            <dd>
+              <GateStatusSection report={gateStatus} />
+            </dd>
+          </div>
+        )}
+
+        {/* Active Review */}
+        {activeReview && (
+          <div className={`${container()} col-span-2`}>
+            <dt className={label()}>Active Review</dt>
+            <dd>
+              <ReviewSection review={activeReview} />
+            </dd>
+          </div>
+        )}
+
         {/* Timestamps row */}
         <div className={container()}>
           <dt className={label()}>Created</dt>
@@ -714,6 +751,220 @@ export function TaskDetail({ task, onDeleted }: TaskDetailProps) {
     </div>
   );
 }
+
+// ============ Gate Status Indicators ============
+
+/** Status icon mapping for gate results */
+const gateStatusIcon: Record<GateStatus, { symbol: string; color: string; label: string }> = {
+  pass: { symbol: "OK", color: "text-status-done", label: "Passed" },
+  fail: { symbol: "X", color: "text-status-blocked", label: "Failed" },
+  error: { symbol: "!", color: "text-status-blocked", label: "Error" },
+  pending: { symbol: "-", color: "text-status-pending", label: "Pending" },
+  running: { symbol: "~", color: "text-status-active", label: "Running" },
+  skip: { symbol: ".", color: "text-text-dim", label: "Skipped" },
+};
+
+/** Summary badge showing pass/fail/total counts */
+function GatesSummaryBadge({ report }: { report: GateStatusReport }) {
+  const passed = report.gates.filter((e) => e.satisfied).length;
+  const total = report.gates.length;
+  const allPassed = passed === total;
+
+  return (
+    <span
+      className={`ml-2 font-mono text-xs px-1.5 py-0.5 rounded ${
+        allPassed
+          ? "bg-status-done/20 text-status-done"
+          : "bg-status-pending/20 text-status-pending"
+      }`}
+    >
+      {passed}/{total}
+      {report.canComplete ? "" : " (blocked)"}
+    </span>
+  );
+}
+
+/** Gate status section showing each gate's result */
+function GateStatusSection({ report }: { report: GateStatusReport }) {
+  return (
+    <ul className="space-y-1.5">
+      {report.gates.map((entry: GateStatusEntry) => {
+        const status = entry.result?.status ?? "pending";
+        const icon = gateStatusIcon[status];
+        const attempt = entry.result?.attempt ?? 0;
+        const maxRetries = entry.gate.maxRetries;
+
+        return (
+          <li
+            key={entry.gate.id}
+            className="flex items-center gap-2 font-mono text-xs p-1.5 bg-surface-primary rounded"
+          >
+            {/* Status indicator */}
+            <span
+              className={`inline-flex items-center justify-center w-6 h-5 rounded text-[10px] font-bold ${icon.color} bg-current/10`}
+              title={icon.label}
+              aria-label={icon.label}
+            >
+              <span className={icon.color}>{icon.symbol}</span>
+            </span>
+
+            {/* Gate info */}
+            <span className="flex-1 text-text-primary truncate" title={entry.gate.description}>
+              {entry.gate.name}
+            </span>
+
+            {/* Gate type tag */}
+            <span className="text-text-dim uppercase text-[10px]">
+              {entry.gate.gateType}
+            </span>
+
+            {/* Attempt counter (show if > 1 or if maxRetries > 1) */}
+            {(attempt > 1 || maxRetries > 1) && (
+              <span className="text-text-dim text-[10px]" title={`Attempt ${attempt} of ${maxRetries}`}>
+                {attempt}/{maxRetries}
+              </span>
+            )}
+
+            {/* Required indicator */}
+            {!entry.gate.required && (
+              <span className="text-text-dim text-[10px]" title="Optional gate">
+                opt
+              </span>
+            )}
+
+            {/* Satisfaction indicator */}
+            {entry.satisfied ? (
+              <span className="text-status-done text-[10px]" title="Satisfied">
+                [ok]
+              </span>
+            ) : (
+              <span className="text-status-blocked text-[10px]" title="Unsatisfied">
+                [--]
+              </span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+// ============ Review Indicators ============
+
+/** Status display for review pipeline stages */
+const reviewStatusDisplay: Record<ReviewStatus, { label: string; color: string; description: string }> = {
+  gates_pending: {
+    label: "Gates Pending",
+    color: "text-status-active",
+    description: "Waiting for gate checks to complete",
+  },
+  agent_pending: {
+    label: "Agent Pending",
+    color: "text-status-active",
+    description: "Waiting for agent review",
+  },
+  human_pending: {
+    label: "Human Pending",
+    color: "text-accent",
+    description: "Waiting for human review",
+  },
+  approved: {
+    label: "Approved",
+    color: "text-status-done",
+    description: "Review approved",
+  },
+  changes_requested: {
+    label: "Changes Requested",
+    color: "text-status-blocked",
+    description: "Changes were requested",
+  },
+};
+
+/** Review pipeline stage indicator */
+function ReviewSection({ review }: { review: Review }) {
+  const display = reviewStatusDisplay[review.status];
+  const stages: Array<{
+    label: string;
+    completedAt: string | null;
+    isCurrent: boolean;
+  }> = [
+    {
+      label: "Gates",
+      completedAt: review.gatesCompletedAt,
+      isCurrent: review.status === "gates_pending",
+    },
+    {
+      label: "Agent",
+      completedAt: review.agentCompletedAt,
+      isCurrent: review.status === "agent_pending",
+    },
+    {
+      label: "Human",
+      completedAt: review.humanCompletedAt,
+      isCurrent: review.status === "human_pending",
+    },
+  ];
+
+  return (
+    <div className="space-y-2">
+      {/* Status badge */}
+      <div className="flex items-center gap-2">
+        <span
+          className={`font-mono text-xs px-2 py-0.5 rounded ${display.color} bg-current/10`}
+          title={display.description}
+        >
+          {display.label}
+        </span>
+        <code className="font-mono text-[10px] text-text-dim">
+          {review.id}
+        </code>
+      </div>
+
+      {/* Pipeline progress - only for non-terminal states */}
+      {review.status !== "approved" && review.status !== "changes_requested" && (
+        <div className="flex items-center gap-1">
+          {stages.map((stage, i) => {
+            const isComplete = stage.completedAt !== null;
+            const isCurrent = stage.isCurrent;
+
+            return (
+              <div key={stage.label} className="flex items-center gap-1">
+                {i > 0 && (
+                  <span className={`w-3 h-px ${isComplete ? "bg-status-done" : "bg-border"}`} />
+                )}
+                <span
+                  className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${
+                    isComplete
+                      ? "bg-status-done/20 text-status-done"
+                      : isCurrent
+                        ? "bg-status-active/20 text-status-active"
+                        : "bg-surface-primary text-text-dim"
+                  }`}
+                  title={
+                    isComplete && stage.completedAt
+                      ? `Completed: ${new Date(stage.completedAt).toLocaleString()}`
+                      : isCurrent
+                        ? "In progress"
+                        : "Pending"
+                  }
+                >
+                  {stage.label}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Submitted timestamp */}
+      <div className="font-mono text-[10px] text-text-dim">
+        Submitted {new Date(review.submittedAt).toLocaleString()}
+      </div>
+    </div>
+  );
+}
+
+// ============ Edit Field ============
 
 interface EditFieldProps {
   value: string;

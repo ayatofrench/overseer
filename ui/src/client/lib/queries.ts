@@ -7,6 +7,8 @@ import type {
   Learning,
   TaskFilter,
   ApiError,
+  GateStatusReport,
+  Review,
 } from "../../types.js";
 
 /** Default refetch interval (5 seconds) */
@@ -46,6 +48,13 @@ export const queryKeys = {
   },
   learnings: {
     byTask: (taskId: string) => ["learnings", taskId] as const,
+  },
+  gates: {
+    status: (taskId: string) => ["gates", "status", taskId] as const,
+  },
+  reviews: {
+    byTask: (taskId: string) => ["reviews", taskId] as const,
+    active: (taskId: string) => ["reviews", "active", taskId] as const,
   },
 } as const;
 
@@ -295,6 +304,77 @@ export function useLearnings(taskId: string | null) {
       }
 
       return res.json() as Promise<Learning[]>;
+    },
+    enabled: !!taskId,
+    refetchInterval: REFETCH_INTERVAL,
+  });
+}
+
+/**
+ * Fetch gate status report for a task.
+ * Returns per-gate status entries and overall canComplete flag.
+ * Silently returns null on error (gates may not be configured).
+ */
+export function useGateStatus(taskId: string | null) {
+  return useQuery({
+    queryKey: queryKeys.gates.status(taskId ?? ""),
+    queryFn: async (): Promise<GateStatusReport | null> => {
+      if (!taskId) return null;
+
+      const res = await fetch(`${API_BASE}/api/gates/status/${taskId}`);
+
+      if (!res.ok) {
+        // Gates may not exist for this task - return null instead of throwing
+        return null;
+      }
+
+      return res.json() as Promise<GateStatusReport>;
+    },
+    enabled: !!taskId,
+    refetchInterval: REFETCH_INTERVAL,
+  });
+}
+
+/**
+ * Fetch the active review for a task (if any).
+ * Returns null if no active review exists.
+ */
+export function useActiveReview(taskId: string | null) {
+  return useQuery({
+    queryKey: queryKeys.reviews.active(taskId ?? ""),
+    queryFn: async (): Promise<Review | null> => {
+      if (!taskId) return null;
+
+      const res = await fetch(`${API_BASE}/api/gates/reviews/${taskId}/active`);
+
+      if (!res.ok) {
+        return null;
+      }
+
+      return res.json() as Promise<Review | null>;
+    },
+    enabled: !!taskId,
+    refetchInterval: REFETCH_INTERVAL,
+  });
+}
+
+/**
+ * Fetch all reviews for a task.
+ */
+export function useReviews(taskId: string | null) {
+  return useQuery({
+    queryKey: queryKeys.reviews.byTask(taskId ?? ""),
+    queryFn: async (): Promise<Review[]> => {
+      if (!taskId) return [];
+
+      const res = await fetch(`${API_BASE}/api/gates/reviews/${taskId}`);
+
+      if (!res.ok) {
+        const err: unknown = await res.json().catch(() => ({}));
+        throw new Error(getErrorMessage(err, "Failed to fetch reviews"));
+      }
+
+      return res.json() as Promise<Review[]>;
     },
     enabled: !!taskId,
     refetchInterval: REFETCH_INTERVAL,

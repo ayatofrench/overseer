@@ -134,6 +134,111 @@ export class CliTimeoutError extends Error {
   }
 }
 
+// ============ Gate Types ============
+
+declare const GateIdBrand: unique symbol;
+export type GateId = string & { readonly [GateIdBrand]: never };
+
+export function isGateId(s: string): s is GateId {
+  return s.startsWith("gate_") && s.length === 31; // "gate_" + 26 ULID chars
+}
+
+export function parseGateId(s: string): GateId {
+  if (!isGateId(s)) {
+    throw new Error(`Invalid GateId: ${s}`);
+  }
+  return s;
+}
+
+export type GateType = "shell" | "metadata" | "manual";
+export type GateStatus = "pending" | "running" | "pass" | "fail" | "error" | "skip";
+export type VerifiedBy = "overseer" | "external";
+
+export interface Gate {
+  id: GateId;
+  taskId: string | null;
+  name: string;
+  description: string;
+  gateType: GateType;
+  config: Record<string, unknown>;
+  command?: string;
+  timeoutSecs?: number;
+  maxRetries: number;
+  required: boolean;
+  appliesTo: string;
+  depthFilter: number | null;
+  ordering: number;
+  createdAt: string;
+}
+
+export interface GateResult {
+  gateId: GateId;
+  taskId: string;
+  status: GateStatus;
+  output: string | null;
+  exitCode: number | null;
+  startedAt: string;
+  completedAt: string | null;
+  commitSha: string | null;
+  reviewId?: string;
+  attempt: number;
+}
+
+export interface GateStatusEntry {
+  gate: Gate;
+  result: GateResult | null;
+  satisfied: boolean;
+  verifiedBy: VerifiedBy;
+}
+
+export interface GateStatusReport {
+  taskId: string;
+  running: boolean;
+  gates: GateStatusEntry[];
+  canComplete: boolean;
+}
+
+export interface UnsatisfiedGate {
+  gate: Gate;
+  result: GateResult | null;
+  reason: string;
+}
+
+// ============ Review Types ============
+
+declare const ReviewIdBrand: unique symbol;
+export type ReviewId = string & { readonly [ReviewIdBrand]: never };
+
+export function isReviewId(s: string): s is ReviewId {
+  return s.startsWith("rev_") && s.length === 30; // "rev_" + 26 ULID chars
+}
+
+export function parseReviewId(s: string): ReviewId {
+  if (!isReviewId(s)) {
+    throw new Error(`Invalid ReviewId: ${s}`);
+  }
+  return s;
+}
+
+export type ReviewStatus =
+  | "gates_pending"
+  | "agent_pending"
+  | "human_pending"
+  | "approved"
+  | "changes_requested";
+
+export interface Review {
+  id: ReviewId;
+  taskId: string;
+  status: ReviewStatus;
+  submittedAt: string;
+  gatesCompletedAt: string | null;
+  agentCompletedAt: string | null;
+  humanCompletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // Request/Response types for API
 
 export interface UpdateTaskRequest {
