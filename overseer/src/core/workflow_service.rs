@@ -4,7 +4,7 @@ use crate::core::{GateExecutor, TaskService};
 use crate::db::{gate_repo, task_repo};
 use crate::error::{NotReadyReason, OsError, Result};
 use crate::id::TaskId;
-use crate::types::{GateResult, GateStatusReport, Task};
+use crate::types::{GateStatusReport, ReviewStatus, Task};
 use crate::vcs::backend::{VcsBackend, VcsError};
 
 /// Coordinates task state transitions with VCS operations.
@@ -520,7 +520,8 @@ impl<'a> TaskWorkflowService<'a> {
 
     /// Run all applicable gates for a task.
     /// Writes pending results, then executes gates synchronously (for worker process).
-    /// Returns the status report after execution.
+    /// If an active review exists, threads its ID through for result scoping.
+    /// Auto-advances review from GatesPending -> AgentPending if all gates pass.
     pub fn run_gates(
         &self,
         task_id: &TaskId,
@@ -531,6 +532,10 @@ impl<'a> TaskWorkflowService<'a> {
             // Return current status instead of starting new run
             return self.task_service.get_gate_status(task_id);
         }
+
+        // Find active review for review_id scoping
+        let active_review = self.task_service.get_active_review(task_id)?;
+        let review_id = active_review.as_ref().map(|r| &r.id);
 
         let depth = self.task_service.get_depth(task_id)?;
         let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
@@ -545,15 +550,26 @@ impl<'a> TaskWorkflowService<'a> {
                 None,
                 None,
                 commit_sha,
+                1,
+                review_id,
             )?;
         }
 
         // Execute gates synchronously (this is the worker path)
         let executor = GateExecutor::new(self.conn);
-        executor.run_all(task_id, commit_sha)?;
+        executor.run_all(task_id, commit_sha, review_id)?;
 
         // Return final status
-        self.task_service.get_gate_status(task_id)
+        let status = self.task_service.get_gate_status(task_id)?;
+
+        // Auto-advance review if all gates pass
+        if let Some(ref review) = active_review {
+            if status.can_complete && review.status == ReviewStatus::GatesPending {
+                let _ = self.task_service.approve_gates(&review.id);
+            }
+        }
+
+        Ok(status)
     }
 }
 
@@ -1490,9 +1506,7 @@ mod tests {
                 gate_type: "manual".to_string(),
                 task_id: Some(task.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1504,6 +1518,8 @@ mod tests {
             crate::types::GateStatus::Skip,
             Some("manual gate — use `os gate pass`"),
             None,
+            None,
+            1,
             None,
         )
         .unwrap();
@@ -1537,9 +1553,7 @@ mod tests {
                 gate_type: "shell".to_string(),
                 task_id: Some(task.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1551,6 +1565,8 @@ mod tests {
             crate::types::GateStatus::Skip,
             None,
             None,
+            None,
+            1,
             None,
         )
         .unwrap();
@@ -1587,9 +1603,7 @@ mod tests {
                 gate_type: "manual".to_string(),
                 task_id: Some(task.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1601,6 +1615,8 @@ mod tests {
             crate::types::GateStatus::Skip,
             None,
             None,
+            None,
+            1,
             None,
         )
         .unwrap();
@@ -1614,7 +1630,7 @@ mod tests {
         );
 
         // Pass the gate explicitly
-        svc.pass_gate(&task.id, &gate.id, Some("Approved"))
+        svc.pass_gate(&task.id, &gate.id, Some("Approved"), None)
             .unwrap();
 
         // Now complete should succeed
@@ -1657,9 +1673,7 @@ mod tests {
                 gate_type: "manual".to_string(),
                 task_id: Some(milestone.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1671,6 +1685,8 @@ mod tests {
             crate::types::GateStatus::Skip,
             None,
             None,
+            None,
+            1,
             None,
         )
         .unwrap();
@@ -1686,7 +1702,7 @@ mod tests {
         );
 
         // Pass the gate
-        svc.pass_gate(&milestone.id, &gate.id, Some("Approved"))
+        svc.pass_gate(&milestone.id, &gate.id, Some("Approved"), None)
             .unwrap();
 
         // Now explicitly completing milestone should work
@@ -1717,9 +1733,7 @@ mod tests {
                 gate_type: "manual".to_string(),
                 task_id: Some(task.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1730,6 +1744,8 @@ mod tests {
             crate::types::GateStatus::Skip,
             None,
             None,
+            None,
+            1,
             None,
         )
         .unwrap();

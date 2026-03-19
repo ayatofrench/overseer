@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
     let current_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -68,6 +68,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
                 description TEXT NOT NULL DEFAULT '',
                 gate_type TEXT NOT NULL CHECK (gate_type IN ('shell', 'metadata', 'manual')),
                 config TEXT NOT NULL DEFAULT '{}',
+                command TEXT,
+                timeout_secs INTEGER,
+                max_retries INTEGER NOT NULL DEFAULT 1,
                 required INTEGER NOT NULL DEFAULT 1,
                 applies_to TEXT NOT NULL DEFAULT 'complete' CHECK (applies_to IN ('complete')),
                 depth_filter INTEGER CHECK (depth_filter BETWEEN 0 AND 2),
@@ -84,7 +87,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
                 started_at TEXT NOT NULL,
                 completed_at TEXT,
                 commit_sha TEXT,
-                PRIMARY KEY (gate_id, task_id)
+                review_id TEXT NOT NULL DEFAULT '',
+                attempt INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (gate_id, task_id, review_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_gates_task ON gates(task_id);
@@ -264,6 +269,46 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 7)?;
         version = 7;
+    }
+
+    // Migration for version 7 -> 8: Promoted gate fields + review_id scoping
+    if version == 7 {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE gates ADD COLUMN command TEXT;
+            ALTER TABLE gates ADD COLUMN timeout_secs INTEGER;
+            ALTER TABLE gates ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 1;
+
+            CREATE TABLE gate_results_v8 (
+                gate_id TEXT NOT NULL REFERENCES gates(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'pass', 'fail', 'error', 'skip')),
+                output TEXT,
+                exit_code INTEGER,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                commit_sha TEXT,
+                review_id TEXT NOT NULL DEFAULT '',
+                attempt INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (gate_id, task_id, review_id)
+            );
+
+            INSERT INTO gate_results_v8 (gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha, review_id, attempt)
+                SELECT gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha, '', 1
+                FROM gate_results;
+
+            DROP TABLE gate_results;
+            ALTER TABLE gate_results_v8 RENAME TO gate_results;
+
+            CREATE INDEX IF NOT EXISTS idx_gate_results_task ON gate_results(task_id);
+            CREATE INDEX IF NOT EXISTS idx_gate_results_status ON gate_results(status)
+                WHERE status IN ('pending', 'running');
+            COMMIT;
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 8)?;
+        version = 8;
     }
 
     // Suppress unused variable warning - version is used for sequential migration chaining

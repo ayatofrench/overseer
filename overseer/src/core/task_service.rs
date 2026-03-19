@@ -897,7 +897,7 @@ impl<'a> TaskService<'a> {
         let depth = self.get_depth(task_id)?;
 
         let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
-        let results = gate_repo::get_results(self.conn, task_id)?;
+        let results = gate_repo::get_results(self.conn, task_id, None)?;
         let result_map: std::collections::HashMap<GateId, GateResult> = results
             .into_iter()
             .map(|r| (r.gate_id.clone(), r))
@@ -954,7 +954,7 @@ impl<'a> TaskService<'a> {
 
     pub fn check_gates(&self, task_id: &TaskId) -> Result<Vec<UnsatisfiedGate>> {
         let depth = self.get_depth(task_id)?;
-        gate_repo::check_gates(self.conn, task_id, depth, "complete")
+        gate_repo::check_gates(self.conn, task_id, depth, "complete", None)
     }
 
     /// Pass a manual gate. Rejects non-manual gates.
@@ -963,6 +963,7 @@ impl<'a> TaskService<'a> {
         task_id: &TaskId,
         gate_id: &GateId,
         output: Option<&str>,
+        review_id: Option<&ReviewId>,
     ) -> Result<GateResult> {
         let gate = gate_repo::get_gate(self.conn, gate_id)?
             .ok_or_else(|| OsError::GateNotFound(gate_id.clone()))?;
@@ -979,6 +980,8 @@ impl<'a> TaskService<'a> {
             output,
             None,
             None,
+            1,
+            review_id,
         )
     }
 
@@ -988,6 +991,7 @@ impl<'a> TaskService<'a> {
         task_id: &TaskId,
         gate_id: &GateId,
         output: Option<&str>,
+        review_id: Option<&ReviewId>,
     ) -> Result<GateResult> {
         let gate = gate_repo::get_gate(self.conn, gate_id)?
             .ok_or_else(|| OsError::GateNotFound(gate_id.clone()))?;
@@ -1004,6 +1008,8 @@ impl<'a> TaskService<'a> {
             output,
             None,
             None,
+            1,
+            review_id,
         )
     }
 
@@ -1013,7 +1019,7 @@ impl<'a> TaskService<'a> {
         task_id: &TaskId,
         gate_id: &GateId,
     ) -> Result<Option<String>> {
-        let result = gate_repo::get_result(self.conn, gate_id, task_id)?;
+        let result = gate_repo::get_result(self.conn, gate_id, task_id, None)?;
         Ok(result.and_then(|r| r.output))
     }
 
@@ -1091,7 +1097,7 @@ impl<'a> TaskService<'a> {
             review_repo::update_status(self.conn, review_id, ReviewStatus::Approved)?;
 
         // Gate bridge: pass all manual gates for this task
-        self.bridge_manual_gates(&result.task_id, GateStatus::Pass)?;
+        self.bridge_manual_gates(&result.task_id, GateStatus::Pass, Some(review_id))?;
 
         Ok(result)
     }
@@ -1114,13 +1120,18 @@ impl<'a> TaskService<'a> {
         )?;
 
         // Gate bridge: fail all manual gates for this task
-        self.bridge_manual_gates(&result.task_id, GateStatus::Fail)?;
+        self.bridge_manual_gates(&result.task_id, GateStatus::Fail, Some(review_id))?;
 
         Ok(result)
     }
 
     /// Bridge review outcome to manual gates: set all manual gates for the task to the given status.
-    fn bridge_manual_gates(&self, task_id: &TaskId, status: GateStatus) -> Result<()> {
+    fn bridge_manual_gates(
+        &self,
+        task_id: &TaskId,
+        status: GateStatus,
+        review_id: Option<&ReviewId>,
+    ) -> Result<()> {
         let depth = self.get_depth(task_id)?;
         let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
 
@@ -1134,6 +1145,8 @@ impl<'a> TaskService<'a> {
                     None,
                     None,
                     None,
+                    1,
+                    review_id,
                 )?;
             }
         }
@@ -2927,9 +2940,7 @@ mod tests {
                 gate_type: "manual".to_string(),
                 task_id: Some(task.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -2937,10 +2948,10 @@ mod tests {
         let review = service.submit_review(&task.id).unwrap();
         let review = service.approve_gates(&review.id).unwrap();
         let review = service.approve_agent(&review.id).unwrap();
-        service.approve_human(&review.id).unwrap();
+        let approved = service.approve_human(&review.id).unwrap();
 
-        // Manual gate should now be passed (bridged)
-        let gate_result = gate_repo::get_result(self::tests::conn_ref(&conn), &gate.id, &task.id)
+        // Manual gate should now be passed (bridged), scoped to review_id
+        let gate_result = gate_repo::get_result(self::tests::conn_ref(&conn), &gate.id, &task.id, Some(&approved.id))
             .unwrap()
             .unwrap();
         assert_eq!(gate_result.status, GateStatus::Pass);
@@ -2960,19 +2971,17 @@ mod tests {
                 gate_type: "manual".to_string(),
                 task_id: Some(task.id.clone()),
                 config: None,
-                required: Some(true),
-                depth_filter: None,
-                ordering: None,
+                ..Default::default()
             })
             .unwrap();
 
         // Submit and request changes
         let review = service.submit_review(&task.id).unwrap();
         let review = service.approve_gates(&review.id).unwrap();
-        service.request_changes(&review.id).unwrap();
+        let rejected = service.request_changes(&review.id).unwrap();
 
-        // Manual gate should now be failed (bridged)
-        let gate_result = gate_repo::get_result(self::tests::conn_ref(&conn), &gate.id, &task.id)
+        // Manual gate should now be failed (bridged), scoped to review_id
+        let gate_result = gate_repo::get_result(self::tests::conn_ref(&conn), &gate.id, &task.id, Some(&rejected.id))
             .unwrap()
             .unwrap();
         assert_eq!(gate_result.status, GateStatus::Fail);

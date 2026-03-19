@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
 use crate::error::Result;
-use crate::id::{GateId, TaskId};
+use crate::id::{GateId, ReviewId, TaskId};
 use crate::types::{
     CreateGateInput, Gate, GateFilter, GateResult, GateStatus, GateType, UnsatisfiedGate,
 };
@@ -40,6 +40,9 @@ fn row_to_gate(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
         description: row.get("description")?,
         gate_type: parse_gate_type(&gate_type_str),
         config: serde_json::from_str(&config_str).unwrap_or(serde_json::json!({})),
+        command: row.get("command")?,
+        timeout_secs: row.get("timeout_secs")?,
+        max_retries: row.get::<_, i32>("max_retries").unwrap_or(1),
         required: row.get::<_, i32>("required")? != 0,
         applies_to: row.get("applies_to")?,
         depth_filter: row.get("depth_filter")?,
@@ -54,6 +57,13 @@ fn row_to_gate_result(row: &rusqlite::Row) -> rusqlite::Result<GateResult> {
     let status_str: String = row.get("status")?;
     let started_str: String = row.get("started_at")?;
     let completed_str: Option<String> = row.get("completed_at")?;
+
+    let review_id_str: String = row.get::<_, String>("review_id").unwrap_or_default();
+    let review_id = if review_id_str.is_empty() {
+        None
+    } else {
+        review_id_str.parse::<ReviewId>().ok()
+    };
 
     Ok(GateResult {
         gate_id: row.get("gate_id")?,
@@ -70,6 +80,8 @@ fn row_to_gate_result(row: &rusqlite::Row) -> rusqlite::Result<GateResult> {
                 .ok()
         }),
         commit_sha: row.get("commit_sha")?,
+        review_id,
+        attempt: row.get::<_, i32>("attempt").unwrap_or(1),
     })
 }
 
@@ -84,10 +96,11 @@ pub fn create_gate(conn: &Connection, input: &CreateGateInput) -> Result<Gate> {
         .unwrap_or_else(|| "{}".to_string());
     let required = input.required.unwrap_or(true) as i32;
     let ordering = input.ordering.unwrap_or(0);
+    let max_retries = input.max_retries.unwrap_or(1);
 
     conn.execute(
-        "INSERT INTO gates (id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'complete', ?8, ?9, ?10)",
+        "INSERT INTO gates (id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'complete', ?11, ?12, ?13)",
         params![
             id,
             input.task_id,
@@ -95,6 +108,9 @@ pub fn create_gate(conn: &Connection, input: &CreateGateInput) -> Result<Gate> {
             input.description,
             gate_type,
             config,
+            input.command,
+            input.timeout_secs,
+            max_retries,
             required,
             input.depth_filter,
             ordering,
@@ -107,7 +123,7 @@ pub fn create_gate(conn: &Connection, input: &CreateGateInput) -> Result<Gate> {
 
 pub fn get_gate(conn: &Connection, id: &GateId) -> Result<Option<Gate>> {
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
+        "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
          FROM gates WHERE id = ?1",
     )?;
 
@@ -118,19 +134,19 @@ pub fn get_gate(conn: &Connection, id: &GateId) -> Result<Option<Gate>> {
 pub fn list_gates(conn: &Connection, filter: &GateFilter) -> Result<Vec<Gate>> {
     let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if filter.project_only {
         (
-            "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
+            "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
              FROM gates WHERE task_id IS NULL ORDER BY ordering, name".to_string(),
             vec![],
         )
     } else if let Some(ref task_id) = filter.task_id {
         (
-            "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
+            "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
              FROM gates WHERE task_id = ?1 ORDER BY ordering, name".to_string(),
             vec![Box::new(task_id.clone())],
         )
     } else {
         (
-            "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
+            "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
              FROM gates ORDER BY ordering, name".to_string(),
             vec![],
         )
@@ -162,7 +178,7 @@ pub fn resolve_gates(
 ) -> Result<Vec<Gate>> {
     // Project-level gates matching depth and transition
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
+        "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
          FROM gates
          WHERE task_id IS NULL
            AND applies_to = ?1
@@ -175,7 +191,7 @@ pub fn resolve_gates(
 
     // Task-specific gates
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, name, description, gate_type, config, required, applies_to, depth_filter, ordering, created_at
+        "SELECT id, task_id, name, description, gate_type, config, command, timeout_secs, max_retries, required, applies_to, depth_filter, ordering, created_at
          FROM gates
          WHERE task_id = ?1
            AND applies_to = ?2
@@ -209,6 +225,8 @@ pub fn set_result(
     output: Option<&str>,
     exit_code: Option<i32>,
     commit_sha: Option<&str>,
+    attempt: i32,
+    review_id: Option<&ReviewId>,
 ) -> Result<GateResult> {
     let now = Utc::now().to_rfc3339();
     let status_str = status.to_string();
@@ -216,16 +234,17 @@ pub fn set_result(
         GateStatus::Pending | GateStatus::Running => None,
         _ => Some(now.clone()),
     };
+    let review_id_str = review_id.map(|r| r.to_string()).unwrap_or_default();
 
     conn.execute(
-        "INSERT INTO gate_results (gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT (gate_id, task_id)
-         DO UPDATE SET status = ?3, output = ?4, exit_code = ?5, started_at = ?6, completed_at = ?7, commit_sha = ?8",
-        params![gate_id, task_id, status_str, output, exit_code, now, completed_at, commit_sha],
+        "INSERT INTO gate_results (gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha, review_id, attempt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT (gate_id, task_id, review_id)
+         DO UPDATE SET status = ?3, output = ?4, exit_code = ?5, started_at = ?6, completed_at = ?7, commit_sha = ?8, attempt = ?10",
+        params![gate_id, task_id, status_str, output, exit_code, now, completed_at, commit_sha, review_id_str, attempt],
     )?;
 
-    get_result(conn, gate_id, task_id)?
+    get_result(conn, gate_id, task_id, review_id)?
         .ok_or_else(|| crate::error::OsError::GateNotFound(gate_id.clone()))
 }
 
@@ -233,26 +252,33 @@ pub fn get_result(
     conn: &Connection,
     gate_id: &GateId,
     task_id: &TaskId,
+    review_id: Option<&ReviewId>,
 ) -> Result<Option<GateResult>> {
+    let review_id_str = review_id.map(|r| r.to_string()).unwrap_or_default();
     let mut stmt = conn.prepare(
-        "SELECT gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha
-         FROM gate_results WHERE gate_id = ?1 AND task_id = ?2",
+        "SELECT gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha, review_id, attempt
+         FROM gate_results WHERE gate_id = ?1 AND task_id = ?2 AND review_id = ?3",
     )?;
 
     let result = stmt
-        .query_row(params![gate_id, task_id], row_to_gate_result)
+        .query_row(params![gate_id, task_id, review_id_str], row_to_gate_result)
         .optional()?;
     Ok(result)
 }
 
-pub fn get_results(conn: &Connection, task_id: &TaskId) -> Result<Vec<GateResult>> {
+pub fn get_results(
+    conn: &Connection,
+    task_id: &TaskId,
+    review_id: Option<&ReviewId>,
+) -> Result<Vec<GateResult>> {
+    let review_id_str = review_id.map(|r| r.to_string()).unwrap_or_default();
     let mut stmt = conn.prepare(
-        "SELECT gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha
-         FROM gate_results WHERE task_id = ?1",
+        "SELECT gate_id, task_id, status, output, exit_code, started_at, completed_at, commit_sha, review_id, attempt
+         FROM gate_results WHERE task_id = ?1 AND review_id = ?2",
     )?;
 
     let results = stmt
-        .query_map(params![task_id], row_to_gate_result)?
+        .query_map(params![task_id, review_id_str], row_to_gate_result)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -281,9 +307,10 @@ pub fn check_gates(
     task_id: &TaskId,
     depth: i32,
     transition: &str,
+    review_id: Option<&ReviewId>,
 ) -> Result<Vec<UnsatisfiedGate>> {
     let gates = resolve_gates(conn, task_id, depth, transition)?;
-    let results = get_results(conn, task_id)?;
+    let results = get_results(conn, task_id, review_id)?;
 
     let result_map: std::collections::HashMap<GateId, GateResult> = results
         .into_iter()

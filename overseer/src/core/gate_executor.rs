@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 use crate::db::{gate_repo, task_repo};
 use crate::error::{OsError, Result};
-use crate::id::TaskId;
+use crate::id::{ReviewId, TaskId};
 use crate::types::{Gate, GateResult, GateStatus, GateType};
 
 const OUTPUT_CAP: usize = 64 * 1024; // 64KB per gate
@@ -21,7 +21,12 @@ impl<'a> GateExecutor<'a> {
 
     /// Run all applicable gates for a task. Called by the worker process.
     /// Executes gates sequentially in ordering, writing results as it goes.
-    pub fn run_all(&self, task_id: &TaskId, commit_sha: Option<&str>) -> Result<Vec<GateResult>> {
+    pub fn run_all(
+        &self,
+        task_id: &TaskId,
+        commit_sha: Option<&str>,
+        review_id: Option<&ReviewId>,
+    ) -> Result<Vec<GateResult>> {
         let task = task_repo::get_task(self.conn, task_id)?
             .ok_or_else(|| OsError::TaskNotFound(task_id.clone()))?;
         let depth = task_repo::get_task_depth(self.conn, task_id)?;
@@ -30,7 +35,6 @@ impl<'a> GateExecutor<'a> {
         let mut results = Vec::new();
 
         for gate in &gates {
-            // Update status to running
             gate_repo::set_result(
                 self.conn,
                 &gate.id,
@@ -39,12 +43,15 @@ impl<'a> GateExecutor<'a> {
                 None,
                 None,
                 commit_sha,
+                1,
+                review_id,
             )?;
 
-            let result = self.run_one(gate, task_id, commit_sha)?;
+            let result = self.run_one(gate, task_id, commit_sha, review_id)?;
             results.push(result);
         }
 
+        let _ = task;
         Ok(results)
     }
 
@@ -53,20 +60,10 @@ impl<'a> GateExecutor<'a> {
         gate: &Gate,
         task_id: &TaskId,
         commit_sha: Option<&str>,
+        review_id: Option<&ReviewId>,
     ) -> Result<GateResult> {
         match gate.gate_type {
-            GateType::Shell => {
-                let (status, output, exit_code) = self.execute_shell(gate, task_id);
-                gate_repo::set_result(
-                    self.conn,
-                    &gate.id,
-                    task_id,
-                    status,
-                    Some(&cap_output(&output)),
-                    exit_code,
-                    commit_sha,
-                )
-            }
+            GateType::Shell => self.execute_shell_with_retry(gate, task_id, commit_sha, review_id),
             GateType::Metadata => {
                 let (status, output) = self.evaluate_metadata(gate, task_id)?;
                 gate_repo::set_result(
@@ -77,10 +74,11 @@ impl<'a> GateExecutor<'a> {
                     Some(&cap_output(&output)),
                     None,
                     commit_sha,
+                    1,
+                    review_id,
                 )
             }
             GateType::Manual => {
-                // Manual gates are skipped by the worker — must use `os gate pass`
                 gate_repo::set_result(
                     self.conn,
                     &gate.id,
@@ -89,21 +87,65 @@ impl<'a> GateExecutor<'a> {
                     Some("manual gate — use `os gate pass`"),
                     None,
                     commit_sha,
+                    1,
+                    review_id,
                 )
             }
         }
     }
 
-    fn execute_shell(&self, gate: &Gate, task_id: &TaskId) -> (GateStatus, String, Option<i32>) {
+    /// Execute a shell gate with retry logic.
+    /// Retries on Fail/Error up to max_retries. Breaks on Pass or Pending (exit 75).
+    fn execute_shell_with_retry(
+        &self,
+        gate: &Gate,
+        task_id: &TaskId,
+        commit_sha: Option<&str>,
+        review_id: Option<&ReviewId>,
+    ) -> Result<GateResult> {
+        let max_retries = gate.max_retries.max(1);
+        let mut last_result = None;
+
+        for attempt in 1..=max_retries {
+            let (status, output, exit_code) = self.execute_shell(gate, task_id, attempt);
+            last_result = Some(gate_repo::set_result(
+                self.conn,
+                &gate.id,
+                task_id,
+                status,
+                Some(&cap_output(&output)),
+                exit_code,
+                commit_sha,
+                attempt,
+                review_id,
+            )?);
+
+            match status {
+                GateStatus::Pass | GateStatus::Pending => break,
+                GateStatus::Fail | GateStatus::Error if attempt < max_retries => continue,
+                _ => break,
+            }
+        }
+
+        last_result.ok_or_else(|| OsError::GateNotFound(gate.id.clone()))
+    }
+
+    fn execute_shell(
+        &self,
+        gate: &Gate,
+        task_id: &TaskId,
+        attempt: i32,
+    ) -> (GateStatus, String, Option<i32>) {
+        // Promoted fields take precedence over config JSON
         let command = gate
-            .config
-            .get("command")
-            .and_then(|v| v.as_str())
+            .command
+            .as_deref()
+            .or_else(|| gate.config.get("command").and_then(|v| v.as_str()))
             .unwrap_or("echo 'no command configured'");
         let timeout_secs = gate
-            .config
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
+            .timeout_secs
+            .map(|t| t as u64)
+            .or_else(|| gate.config.get("timeout_secs").and_then(|v| v.as_u64()))
             .unwrap_or(300);
 
         let resolved_command = self.resolve_templates(command, task_id);
@@ -116,17 +158,16 @@ impl<'a> GateExecutor<'a> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&resolved_command);
 
-        // Set environment variables
         cmd.env("OVERSEER_TASK_ID", task_id.to_string());
         cmd.env("OVERSEER_GATE_NAME", &gate.name);
         cmd.env("OVERSEER_GATE_ID", gate.id.to_string());
+        cmd.env("OVERSEER_ATTEMPT", attempt.to_string());
 
         if let Some(ref cwd_path) = cwd {
             let expanded = shellexpand::tilde(cwd_path);
             cmd.current_dir(expanded.as_ref());
         }
 
-        // Capture stdout and stderr
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -139,12 +180,16 @@ impl<'a> GateExecutor<'a> {
             Ok(child) => {
                 let timeout = Duration::from_secs(timeout_secs);
                 match wait_with_timeout(child, timeout) {
-                    WaitResult::Completed { code, stdout, stderr } => {
+                    WaitResult::Completed {
+                        code,
+                        stdout,
+                        stderr,
+                    } => {
                         let output = format_output(&stdout, &stderr);
-                        let status = if code == 0 {
-                            GateStatus::Pass
-                        } else {
-                            GateStatus::Fail
+                        let status = match code {
+                            0 => GateStatus::Pass,
+                            75 => GateStatus::Pending,
+                            _ => GateStatus::Fail,
                         };
                         (status, output, Some(code))
                     }
@@ -224,13 +269,11 @@ impl<'a> GateExecutor<'a> {
         let mut result = template.to_string();
         result = result.replace("{{task_id}}", &task_id.to_string());
 
-        // Resolve workspace and bookmark from task metadata + fields
         if result.contains("{{workspace}}") || result.contains("{{bookmark}}") {
             if let Ok(Some(task)) = task_repo::get_task(self.conn, task_id) {
                 if let Some(ref bookmark) = task.bookmark {
                     result = result.replace("{{bookmark}}", bookmark);
                 }
-                // Try workspace from metadata
                 if let Ok(Some(meta)) = task_repo::get_metadata(self.conn, task_id) {
                     if let Some(ws) = meta.get("workspacePath").and_then(|v| v.as_str()) {
                         result = result.replace("{{workspace}}", ws);
@@ -262,7 +305,6 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> WaitR
 
     let (tx, rx) = mpsc::channel();
 
-    // Take stdout/stderr handles before moving child to thread
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
@@ -272,7 +314,6 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> WaitR
         child
     });
 
-    // Read stdout and stderr concurrently to avoid deadlock when pipe buffers fill
     let (stdout, stderr) = thread::scope(|s| {
         let stdout_thread = s.spawn(|| {
             stdout_handle
@@ -314,7 +355,6 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> WaitR
             WaitResult::Error(e.to_string())
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Kill the child process
             if let Ok(mut child) = child_thread.join() {
                 let _ = child.kill();
                 let _ = child.wait();

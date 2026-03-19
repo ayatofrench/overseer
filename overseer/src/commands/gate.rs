@@ -81,6 +81,18 @@ pub struct AddArgs {
     /// Human-readable description
     #[arg(long)]
     pub description: Option<String>,
+
+    /// Shell command to execute (for shell gates)
+    #[arg(long)]
+    pub command: Option<String>,
+
+    /// Timeout in seconds (for shell gates, default: 300)
+    #[arg(long)]
+    pub timeout: Option<i64>,
+
+    /// Max retries on failure (default: 1)
+    #[arg(long)]
+    pub max_retries: Option<i32>,
 }
 
 #[derive(Args)]
@@ -186,12 +198,12 @@ pub fn handle(conn: &Connection, cmd: GateCommand) -> Result<GateResultType> {
         }
 
         GateCommand::Pass(args) => {
-            let result = svc.pass_gate(&args.task_id, &args.gate_id, args.output.as_deref(), None)?;
+            let result = svc.pass_gate(&args.task_id, &args.gate_id, args.output.as_deref(), None::<&crate::id::ReviewId>)?;
             Ok(GateResultType::GateResult(result))
         }
 
         GateCommand::Fail(args) => {
-            let result = svc.fail_gate(&args.task_id, &args.gate_id, args.output.as_deref(), None)?;
+            let result = svc.fail_gate(&args.task_id, &args.gate_id, args.output.as_deref(), None::<&crate::id::ReviewId>)?;
             Ok(GateResultType::GateResult(result))
         }
 
