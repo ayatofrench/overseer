@@ -386,6 +386,11 @@ impl<'a> TaskWorkflowService<'a> {
                 }
                 self.complete_milestone(&parent_id, None)?;
             } else {
+                // Check gates before auto-completing depth-1 tasks (same as milestone path)
+                let unsatisfied = self.task_service.check_gates(&parent_id)?;
+                if !unsatisfied.is_empty() {
+                    break; // Unsatisfied gates stop bubbling
+                }
                 self.task_service.complete(&parent_id, None)?;
             }
 
@@ -1707,6 +1712,91 @@ mod tests {
 
         // Now explicitly completing milestone should work
         let completed = service.complete_milestone(&milestone.id, None).unwrap();
+        assert!(completed.completed);
+    }
+
+    #[test]
+    fn test_bubble_up_respects_gates_on_depth1_task() {
+        let conn = setup_db();
+        let service = TaskWorkflowService::new(&conn, mock_vcs());
+        let svc = service.task_service();
+
+        // Create: milestone -> task (depth 1) -> subtask (depth 2)
+        let milestone = svc
+            .create(&CreateTaskInput {
+                description: "Milestone".to_string(),
+                context: None,
+                parent_id: None,
+                priority: Some(0),
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        let task = svc
+            .create(&CreateTaskInput {
+                description: "Task with gate".to_string(),
+                context: None,
+                parent_id: Some(milestone.id.clone()),
+                priority: Some(0),
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        let subtask = svc
+            .create(&CreateTaskInput {
+                description: "Subtask".to_string(),
+                context: None,
+                parent_id: Some(task.id.clone()),
+                priority: Some(0),
+                blocked_by: vec![],
+            })
+            .unwrap();
+
+        // Create required manual gate on the depth-1 task
+        let gate = svc
+            .create_gate(&crate::types::CreateGateInput {
+                name: "code-review".to_string(),
+                description: "".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task.id.clone()),
+                config: None,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Set gate to Skip (unsatisfied for manual gates)
+        gate_repo::set_result(
+            &conn,
+            &gate.id,
+            &task.id,
+            crate::types::GateStatus::Skip,
+            None,
+            None,
+            None,
+            1,
+            None,
+        )
+        .unwrap();
+
+        // Complete the subtask — should NOT auto-complete task (gate unsatisfied)
+        service.complete(&subtask.id, None).unwrap();
+
+        let task_after = svc.get(&task.id).unwrap();
+        assert!(
+            !task_after.completed,
+            "Depth-1 task should NOT auto-complete when it has an unsatisfied gate"
+        );
+
+        // Milestone also should not be completed
+        let milestone_after = svc.get(&milestone.id).unwrap();
+        assert!(!milestone_after.completed);
+
+        // Pass the gate explicitly
+        svc.pass_gate(&task.id, &gate.id, Some("Approved"), None)
+            .unwrap();
+
+        // Now explicitly completing task should succeed
+        let completed = service.complete(&task.id, None).unwrap();
         assert!(completed.completed);
     }
 
