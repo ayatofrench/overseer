@@ -4,7 +4,8 @@ use owo_colors::{OwoColorize, Style};
 use serde::Deserialize;
 
 use crate::commands::{
-    learning::LearningCommand, task::TaskCommand, vcs::VcsCommand, DataCommand,
+    gate::GateCommand, learning::LearningCommand, review::ReviewCommand, task::TaskCommand,
+    vcs::VcsCommand, DataCommand,
 };
 use crate::db;
 use crate::id::TaskId;
@@ -108,6 +109,12 @@ struct Colors {
     milestone: Style,
     tree_line: Style,
     error: Style,
+    gate_pass: Style,
+    gate_fail: Style,
+    gate_pending: Style,
+    gate_skip: Style,
+    gate_running: Style,
+    label: Style,
 }
 
 impl Colors {
@@ -125,6 +132,12 @@ impl Colors {
                 milestone: Style::new().bold(),
                 tree_line: Style::new().dimmed(),
                 error: Style::new().red().bold(),
+                gate_pass: Style::new().green(),
+                gate_fail: Style::new().red(),
+                gate_pending: Style::new().yellow(),
+                gate_skip: Style::new().dimmed(),
+                gate_running: Style::new().cyan(),
+                label: Style::new().dimmed(),
             }
         } else {
             // No-op styles when color disabled
@@ -140,6 +153,12 @@ impl Colors {
                 milestone: Style::new(),
                 tree_line: Style::new(),
                 error: Style::new(),
+                gate_pass: Style::new(),
+                gate_fail: Style::new(),
+                gate_pending: Style::new(),
+                gate_skip: Style::new(),
+                gate_running: Style::new(),
+                label: Style::new(),
             }
         }
     }
@@ -244,14 +263,18 @@ impl Printer {
             Command::Data(DataCommand::Export { .. }) => {
                 self.print_data_export(output);
             }
-            // Gate commands: JSON passthrough (no special pretty-print yet)
-            Command::Gate(_) => {
-                println!("{}", output);
-            }
-            // Review commands: JSON passthrough
-            Command::Review(_) => {
-                println!("{}", output);
-            }
+            Command::Gate(GateCommand::Add(_)) => self.print_gate(output),
+            Command::Gate(GateCommand::List(_)) => self.print_gate_list(output),
+            Command::Gate(GateCommand::Delete { .. }) => println!("Gate deleted"),
+            Command::Gate(GateCommand::Run(_)) => self.print_gate_status(output),
+            Command::Gate(GateCommand::Status { .. }) => self.print_gate_status(output),
+            Command::Gate(GateCommand::Output(_)) => self.print_gate_output(output),
+            Command::Gate(GateCommand::Pass(_)) => self.print_gate_result(output),
+            Command::Gate(GateCommand::Fail(_)) => self.print_gate_result(output),
+            Command::Gate(GateCommand::Check { .. }) => self.print_gate_check(output),
+            Command::Review(ReviewCommand::List(_)) => self.print_review_list(output),
+            Command::Review(ReviewCommand::Active { .. }) => self.print_review_maybe(output),
+            Command::Review(_) => self.print_review(output),
             // PRECONDITION: Completions handled in main() before print() is called
             Command::Completions { .. } => unreachable!("completions handled before print()"),
             // PRECONDITION: UI and MCP handled in main() before print() is called
@@ -863,6 +886,344 @@ impl Printer {
             println!("{}", output);
         }
     }
+
+    // ============ Gate Pretty-Print ============
+
+    /// Symbol and style for a gate status value
+    fn gate_status_display(&self, status: &types::GateStatus) -> (&'static str, Style) {
+        match status {
+            types::GateStatus::Pass => ("PASS", self.colors.gate_pass),
+            types::GateStatus::Fail => ("FAIL", self.colors.gate_fail),
+            types::GateStatus::Pending => ("PENDING", self.colors.gate_pending),
+            types::GateStatus::Running => ("RUNNING", self.colors.gate_running),
+            types::GateStatus::Error => ("ERROR", self.colors.error),
+            types::GateStatus::Skip => ("SKIP", self.colors.gate_skip),
+        }
+    }
+
+    /// Print a single gate definition (add result)
+    fn print_gate(&self, output: &str) {
+        if let Ok(gate) = serde_json::from_str::<types::Gate>(output) {
+            println!(
+                "Gate: {} ({})",
+                self.fmt_id(&gate.id),
+                gate.gate_type.to_string().style(self.colors.label)
+            );
+            println!("  Name: {}", gate.name);
+            if !gate.description.is_empty() {
+                println!("  Description: {}", gate.description);
+            }
+            if let Some(ref cmd) = gate.command {
+                println!("  Command: {}", cmd);
+            }
+            if let Some(timeout) = gate.timeout_secs {
+                println!("  Timeout: {}s", timeout);
+            }
+            if gate.max_retries > 1 {
+                println!("  Retries: {}", gate.max_retries);
+            }
+            println!(
+                "  Required: {}",
+                if gate.required { "yes" } else { "no" }
+            );
+            if let Some(depth) = gate.depth_filter {
+                let depth_label = match depth {
+                    0 => "milestones",
+                    1 => "tasks",
+                    2 => "subtasks",
+                    _ => "unknown",
+                };
+                println!("  Depth: {} ({})", depth, depth_label);
+            }
+            if let Some(ref task_id) = gate.task_id {
+                println!("  Task: {}", self.fmt_id(task_id));
+            } else {
+                println!(
+                    "  Scope: {}",
+                    "project-level".style(self.colors.label)
+                );
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    /// Print a list of gate definitions
+    fn print_gate_list(&self, output: &str) {
+        if let Ok(gates) = serde_json::from_str::<Vec<types::Gate>>(output) {
+            if gates.is_empty() {
+                println!("No gates defined");
+            } else {
+                for gate in &gates {
+                    let scope = if gate.task_id.is_some() {
+                        "task"
+                    } else {
+                        "project"
+                    };
+                    let req = if gate.required { "*" } else { " " };
+                    let mut details = vec![gate.gate_type.to_string()];
+                    if let Some(ref cmd) = gate.command {
+                        // Truncate long commands
+                        let display_cmd = if cmd.len() > 40 {
+                            format!("{}...", &cmd[..37])
+                        } else {
+                            cmd.clone()
+                        };
+                        details.push(format!("cmd={}", display_cmd));
+                    }
+                    if let Some(timeout) = gate.timeout_secs {
+                        details.push(format!("{}s", timeout));
+                    }
+                    if gate.max_retries > 1 {
+                        details.push(format!("retries={}", gate.max_retries));
+                    }
+                    println!(
+                        "  {}{} {} [{}] ({})",
+                        req,
+                        self.fmt_id(&gate.id),
+                        gate.name,
+                        details.join(", "),
+                        scope.style(self.colors.label)
+                    );
+                }
+                println!(
+                    "\n{} gate(s) (* = required)",
+                    gates.len()
+                );
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    /// Print gate status report (run / status commands)
+    fn print_gate_status(&self, output: &str) {
+        if let Ok(report) = serde_json::from_str::<types::GateStatusReport>(output) {
+            println!("Gates for task {}", self.fmt_id(&report.task_id));
+            if report.gates.is_empty() {
+                println!("  No gates applicable");
+            } else {
+                for entry in &report.gates {
+                    let (label, style) = if let Some(ref result) = entry.result {
+                        self.gate_status_display(&result.status)
+                    } else {
+                        ("--", self.colors.gate_skip)
+                    };
+
+                    let satisfied_mark = if entry.satisfied {
+                        "✓".style(self.colors.gate_pass).to_string()
+                    } else {
+                        "✗".style(self.colors.gate_fail).to_string()
+                    };
+
+                    print!(
+                        "  {} [{}] {}",
+                        satisfied_mark,
+                        label.style(style),
+                        entry.gate.name
+                    );
+
+                    // Show attempt/retries if relevant
+                    if let Some(ref result) = entry.result {
+                        if result.attempt > 1 || entry.gate.max_retries > 1 {
+                            print!(
+                                " (attempt {}/{})",
+                                result.attempt, entry.gate.max_retries
+                            );
+                        }
+                        if let Some(ref review_id) = result.review_id {
+                            print!(
+                                " review={}",
+                                self.fmt_id(review_id)
+                            );
+                        }
+                        if result.status == types::GateStatus::Pending {
+                            print!(
+                                " {}",
+                                "[exit 75]".style(self.colors.gate_pending)
+                            );
+                        }
+                    }
+                    println!();
+                }
+            }
+            println!();
+            if report.can_complete {
+                println!(
+                    "{}",
+                    "All gates satisfied -- ready to complete".style(self.colors.gate_pass)
+                );
+            } else {
+                println!(
+                    "{}",
+                    "Gates unsatisfied -- cannot complete".style(self.colors.gate_fail)
+                );
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    /// Print a single gate result (pass/fail commands)
+    fn print_gate_result(&self, output: &str) {
+        if let Ok(result) = serde_json::from_str::<types::GateResult>(output) {
+            let (label, style) = self.gate_status_display(&result.status);
+            println!(
+                "Gate {} [{}]",
+                self.fmt_id(&result.gate_id),
+                label.style(style)
+            );
+            if result.attempt > 1 {
+                println!("  Attempt: {}", result.attempt);
+            }
+            if let Some(ref review_id) = result.review_id {
+                println!("  Review: {}", self.fmt_id(review_id));
+            }
+            if let Some(code) = result.exit_code {
+                println!("  Exit code: {}", code);
+            }
+            if let Some(ref out) = result.output {
+                if !out.is_empty() {
+                    println!("  Output: {}", out);
+                }
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    /// Print gate check results (unsatisfied gates list)
+    fn print_gate_check(&self, output: &str) {
+        if let Ok(unsatisfied) = serde_json::from_str::<Vec<types::UnsatisfiedGate>>(output) {
+            if unsatisfied.is_empty() {
+                println!(
+                    "{}",
+                    "All gates satisfied -- ready to complete".style(self.colors.gate_pass)
+                );
+            } else {
+                println!(
+                    "{} unsatisfied gate(s):",
+                    unsatisfied.len().style(self.colors.gate_fail)
+                );
+                for u in &unsatisfied {
+                    print!(
+                        "  {} {} - {}",
+                        "✗".style(self.colors.gate_fail),
+                        u.gate.name,
+                        u.reason
+                    );
+                    if let Some(ref result) = u.result {
+                        if result.attempt > 1 || u.gate.max_retries > 1 {
+                            print!(
+                                " (attempt {}/{})",
+                                result.attempt, u.gate.max_retries
+                            );
+                        }
+                    }
+                    println!();
+                }
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    /// Print gate output (raw output from last execution)
+    fn print_gate_output(&self, output: &str) {
+        if let Ok(maybe_output) = serde_json::from_str::<Option<String>>(output) {
+            match maybe_output {
+                Some(text) => print!("{}", text),
+                None => println!("No output recorded"),
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    // ============ Review Pretty-Print ============
+
+    /// Style for a review status
+    fn review_status_display(&self, status: &types::ReviewStatus) -> (&'static str, Style) {
+        match status {
+            types::ReviewStatus::GatesPending => ("gates_pending", self.colors.gate_pending),
+            types::ReviewStatus::AgentPending => ("agent_pending", self.colors.gate_pending),
+            types::ReviewStatus::HumanPending => ("human_pending", self.colors.gate_pending),
+            types::ReviewStatus::Approved => ("approved", self.colors.gate_pass),
+            types::ReviewStatus::ChangesRequested => ("changes_requested", self.colors.gate_fail),
+        }
+    }
+
+    /// Print a single review
+    fn print_review(&self, output: &str) {
+        if let Ok(review) = serde_json::from_str::<types::Review>(output) {
+            let (label, style) = self.review_status_display(&review.status);
+            println!(
+                "Review: {} [{}]",
+                self.fmt_id(&review.id),
+                label.style(style)
+            );
+            println!("  Task: {}", self.fmt_id(&review.task_id));
+            println!("  Submitted: {}", review.submitted_at.format("%Y-%m-%d %H:%M"));
+            // Phase completion timestamps
+            if let Some(ref at) = review.gates_completed_at {
+                println!(
+                    "  Gates: {} {}",
+                    "done".style(self.colors.gate_pass),
+                    at.format("%Y-%m-%d %H:%M")
+                );
+            }
+            if let Some(ref at) = review.agent_completed_at {
+                println!(
+                    "  Agent: {} {}",
+                    "done".style(self.colors.gate_pass),
+                    at.format("%Y-%m-%d %H:%M")
+                );
+            }
+            if let Some(ref at) = review.human_completed_at {
+                println!(
+                    "  Human: {} {}",
+                    "done".style(self.colors.gate_pass),
+                    at.format("%Y-%m-%d %H:%M")
+                );
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    /// Print a review that may be null (active review query)
+    fn print_review_maybe(&self, output: &str) {
+        if output.trim() == "null" {
+            println!("No active review");
+        } else {
+            self.print_review(output);
+        }
+    }
+
+    /// Print a list of reviews
+    fn print_review_list(&self, output: &str) {
+        if let Ok(reviews) = serde_json::from_str::<Vec<types::Review>>(output) {
+            if reviews.is_empty() {
+                println!("No reviews found");
+            } else {
+                for review in &reviews {
+                    let (label, style) = self.review_status_display(&review.status);
+                    println!(
+                        "  {} [{}] task={} submitted={}",
+                        self.fmt_id(&review.id),
+                        label.style(style),
+                        self.fmt_id(&review.task_id),
+                        review.submitted_at.format("%Y-%m-%d %H:%M")
+                    );
+                }
+                println!("\n{} review(s)", reviews.len());
+            }
+        } else {
+            println!("{}", output);
+        }
+    }
+
+    // ============ Data Pretty-Print ============
 
     fn print_data_export(&self, output: &str) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(output) {
