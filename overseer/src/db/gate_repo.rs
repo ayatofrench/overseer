@@ -1,10 +1,13 @@
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
 use crate::error::Result;
 use crate::id::{GateId, ReviewId, TaskId};
 use crate::types::{
-    CreateGateInput, Gate, GateFilter, GateResult, GateStatus, GateType, UnsatisfiedGate,
+    CreateGateInput, Gate, GateFilter, GateResult, GateSource, GateStatus, GateType,
+    UnsatisfiedGate,
 };
 
 fn parse_gate_type(s: &str) -> GateType {
@@ -47,6 +50,7 @@ fn row_to_gate(row: &rusqlite::Row) -> rusqlite::Result<Gate> {
         created_at: DateTime::parse_from_rfc3339(&created_str)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
+        source: GateSource::Db,
     })
 }
 
@@ -161,13 +165,16 @@ pub fn delete_gate(conn: &Connection, id: &GateId) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the effective gate set for a task: project-level + task-specific,
-/// with task-specific overriding project-level by name.
+/// Resolve the effective gate set for a task: file-based + project-level DB + task-specific,
+/// with higher-priority sources overriding lower-priority ones by name.
+///
+/// Priority (highest wins): task-specific DB > project-level DB > file gates
 pub fn resolve_gates(
     conn: &Connection,
     task_id: &TaskId,
     depth: i32,
     transition: &str,
+    search_dir: &Path,
 ) -> Result<Vec<Gate>> {
     // Project-level gates matching depth and transition
     let mut stmt = conn.prepare(
@@ -194,8 +201,21 @@ pub fn resolve_gates(
         .query_map(params![task_id, transition], row_to_gate)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    // Merge: task-specific overrides project-level by name
+    // File-based gates (lowest priority — project-level defaults)
+    let file_gates: Vec<Gate> = crate::gate_config::load_file_gates(search_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|g| {
+            g.applies_to == transition
+                && (g.depth_filter.is_none() || g.depth_filter == Some(depth))
+        })
+        .collect();
+
+    // Merge: file gates first (lowest), then project DB, then task DB (highest)
     let mut by_name: std::collections::HashMap<String, Gate> = std::collections::HashMap::new();
+    for gate in file_gates {
+        by_name.insert(gate.name.clone(), gate);
+    }
     for gate in project_gates {
         by_name.insert(gate.name.clone(), gate);
     }
@@ -301,8 +321,9 @@ pub fn check_gates(
     depth: i32,
     transition: &str,
     review_id: Option<&ReviewId>,
+    search_dir: &Path,
 ) -> Result<Vec<UnsatisfiedGate>> {
-    let gates = resolve_gates(conn, task_id, depth, transition)?;
+    let gates = resolve_gates(conn, task_id, depth, transition, search_dir)?;
     let results = get_results(conn, task_id, review_id)?;
 
     let result_map: std::collections::HashMap<GateId, GateResult> = results
@@ -349,3 +370,147 @@ pub fn check_gates(
 
 // Make query_row.optional() available
 use rusqlite::OptionalExtension;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema;
+    use tempfile::TempDir;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        schema::init_schema(&conn).unwrap();
+        conn
+    }
+
+    fn create_test_task(conn: &Connection) -> TaskId {
+        use chrono::Utc;
+        let task_id = TaskId::new();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO tasks (id, description, context, priority, completed, cancelled, archived, created_at, updated_at)
+             VALUES (?1, 'test task', '', 0, 0, 0, 0, ?2, ?2)",
+            params![task_id, now],
+        )
+        .unwrap();
+        task_id
+    }
+
+    fn write_gates_json(dir: &std::path::Path, json: &str) {
+        std::fs::create_dir_all(dir.join(".overseer")).unwrap();
+        std::fs::write(dir.join(".overseer/gates.json"), json).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_gates_no_file_returns_empty() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let task_id = create_test_task(&conn);
+
+        let gates = resolve_gates(&conn, &task_id, 1, "complete", dir.path()).unwrap();
+        assert!(gates.is_empty());
+    }
+
+    #[test]
+    fn test_file_gates_appear_in_resolve_gates() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let task_id = create_test_task(&conn);
+
+        write_gates_json(
+            dir.path(),
+            r#"{"gates": [{"name": "build", "type": "shell", "depth_filter": 1}]}"#,
+        );
+
+        let gates = resolve_gates(&conn, &task_id, 1, "complete", dir.path()).unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].name, "build");
+        assert_eq!(gates[0].source, crate::types::GateSource::File);
+    }
+
+    #[test]
+    fn test_file_gate_filtered_by_depth() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let task_id = create_test_task(&conn);
+
+        // depth_filter=1 gate should not appear for depth 2
+        write_gates_json(
+            dir.path(),
+            r#"{"gates": [{"name": "build", "type": "shell", "depth_filter": 1}]}"#,
+        );
+
+        let gates = resolve_gates(&conn, &task_id, 2, "complete", dir.path()).unwrap();
+        assert!(gates.is_empty());
+    }
+
+    #[test]
+    fn test_db_project_gate_overrides_file_gate_by_name() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let task_id = create_test_task(&conn);
+
+        write_gates_json(
+            dir.path(),
+            r#"{"gates": [{"name": "build", "type": "shell"}]}"#,
+        );
+
+        // DB project-level gate with same name
+        create_gate(
+            &conn,
+            &CreateGateInput {
+                name: "build".to_string(),
+                description: "DB build".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: None,
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            },
+        )
+        .unwrap();
+
+        let gates = resolve_gates(&conn, &task_id, 1, "complete", dir.path()).unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].name, "build");
+        // DB gate wins
+        assert_eq!(gates[0].gate_type, GateType::Manual);
+        assert_eq!(gates[0].source, crate::types::GateSource::Db);
+    }
+
+    #[test]
+    fn test_db_task_gate_overrides_file_gate_by_name() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let task_id = create_test_task(&conn);
+
+        write_gates_json(
+            dir.path(),
+            r#"{"gates": [{"name": "build", "type": "shell"}]}"#,
+        );
+
+        // DB task-specific gate with same name
+        create_gate(
+            &conn,
+            &CreateGateInput {
+                name: "build".to_string(),
+                description: "task-specific build".to_string(),
+                gate_type: "manual".to_string(),
+                task_id: Some(task_id.clone()),
+                config: None,
+                required: Some(true),
+                depth_filter: None,
+                ordering: None,
+            },
+        )
+        .unwrap();
+
+        let gates = resolve_gates(&conn, &task_id, 1, "complete", dir.path()).unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].name, "build");
+        assert_eq!(gates[0].gate_type, GateType::Manual);
+        assert_eq!(gates[0].source, crate::types::GateSource::Db);
+    }
+}

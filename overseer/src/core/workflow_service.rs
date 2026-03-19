@@ -543,7 +543,8 @@ impl<'a> TaskWorkflowService<'a> {
         let review_id = active_review.as_ref().map(|r| &r.id);
 
         let depth = self.task_service.get_depth(task_id)?;
-        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete", &cwd)?;
 
         // Write pending results for all gates
         for gate in &gates {

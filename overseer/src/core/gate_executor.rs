@@ -31,7 +31,8 @@ impl<'a> GateExecutor<'a> {
             .ok_or_else(|| OsError::TaskNotFound(task_id.clone()))?;
         let depth = task_repo::get_task_depth(self.conn, task_id)?;
 
-        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete", &cwd)?;
         let mut results = Vec::new();
 
         for gate in &gates {

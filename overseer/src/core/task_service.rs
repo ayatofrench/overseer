@@ -885,18 +885,41 @@ impl<'a> TaskService<'a> {
     }
 
     pub fn list_gates(&self, filter: &GateFilter) -> Result<Vec<Gate>> {
-        gate_repo::list_gates(self.conn, filter)
+        let mut db_gates = gate_repo::list_gates(self.conn, filter)?;
+
+        // Merge file gates when showing project-level or all gates
+        if filter.task_id.is_none() {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let file_gates = crate::gate_config::load_file_gates(&cwd).unwrap_or_default();
+            let db_project_names: std::collections::HashSet<String> = db_gates
+                .iter()
+                .filter(|g| g.task_id.is_none())
+                .map(|g| g.name.clone())
+                .collect();
+            for fg in file_gates {
+                if !db_project_names.contains(&fg.name) {
+                    db_gates.push(fg);
+                }
+            }
+            db_gates.sort_by_key(|g| (g.ordering, g.name.clone()));
+        }
+
+        Ok(db_gates)
     }
 
     pub fn delete_gate(&self, id: &GateId) -> Result<()> {
+        if id.is_file_gate() {
+            return Err(OsError::GateIsReadOnly(id.clone()));
+        }
         gate_repo::delete_gate(self.conn, id)
     }
 
     pub fn get_gate_status(&self, task_id: &TaskId) -> Result<GateStatusReport> {
         let task = self.get_task_or_err(task_id)?;
         let depth = self.get_depth(task_id)?;
+        let cwd = std::env::current_dir().unwrap_or_default();
 
-        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete", &cwd)?;
         let results = gate_repo::get_results(self.conn, task_id, None)?;
         let result_map: std::collections::HashMap<GateId, GateResult> = results
             .into_iter()
@@ -954,7 +977,8 @@ impl<'a> TaskService<'a> {
 
     pub fn check_gates(&self, task_id: &TaskId) -> Result<Vec<UnsatisfiedGate>> {
         let depth = self.get_depth(task_id)?;
-        gate_repo::check_gates(self.conn, task_id, depth, "complete", None)
+        let cwd = std::env::current_dir().unwrap_or_default();
+        gate_repo::check_gates(self.conn, task_id, depth, "complete", None, &cwd)
     }
 
     /// Pass a manual gate. Rejects non-manual gates.
@@ -1133,7 +1157,8 @@ impl<'a> TaskService<'a> {
         review_id: Option<&ReviewId>,
     ) -> Result<()> {
         let depth = self.get_depth(task_id)?;
-        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete")?;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete", &cwd)?;
 
         for gate in gates {
             if gate.gate_type == GateType::Manual {
@@ -3023,5 +3048,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn test_file_gate_cannot_be_deleted() {
+        let conn = setup_db();
+        let service = TaskService::new(&conn);
+
+        let file_gate_id = crate::id::GateId::from_file_gate("build");
+        let result = service.delete_gate(&file_gate_id);
+        assert!(
+            matches!(result, Err(OsError::GateIsReadOnly(_))),
+            "Expected GateIsReadOnly error, got: {:?}",
+            result
+        );
     }
 }

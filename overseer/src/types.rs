@@ -178,6 +178,17 @@ pub struct ListTasksFilter {
 
 // ============ Gate Types ============
 
+/// Indicates where a gate definition originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GateSource {
+    /// Gate stored in the local database (default).
+    #[default]
+    Db,
+    /// Gate loaded from `.overseer/gates.json` in the repository.
+    File,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GateType {
@@ -261,6 +272,9 @@ pub struct Gate {
     pub depth_filter: Option<i32>,
     pub ordering: i32,
     pub created_at: DateTime<Utc>,
+    /// Origin of this gate definition.
+    #[serde(default)]
+    pub source: GateSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

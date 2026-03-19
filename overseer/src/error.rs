@@ -132,6 +132,9 @@ pub enum OsError {
     #[error("Invalid gate type: {0}")]
     InvalidGateType(String),
 
+    #[error("Gate {0} is read-only (defined in .overseer/gates.json — remove it from the file to delete)")]
+    GateIsReadOnly(GateId),
+
     // Review errors
     #[error("Review not found: {0}")]
     ReviewNotFound(ReviewId),

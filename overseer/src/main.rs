@@ -9,6 +9,7 @@ mod commands;
 mod core;
 mod db;
 mod error;
+mod gate_config;
 mod id;
 mod output;
 mod types;

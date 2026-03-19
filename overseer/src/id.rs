@@ -127,6 +127,16 @@ impl GateId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Create a synthetic, deterministic ID for a file-based gate.
+    pub fn from_file_gate(name: &str) -> Self {
+        Self(format!("gate_file_{}", name))
+    }
+
+    /// Returns true if this ID was created for a file-based gate.
+    pub fn is_file_gate(&self) -> bool {
+        self.0.starts_with("gate_file_")
+    }
 }
 
 impl Default for GateId {
