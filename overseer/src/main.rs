@@ -517,7 +517,6 @@ fn clone_task_cmd(cmd: &TaskCommand) -> TaskCommand {
             id: args.id.clone(),
             result: args.result.clone(),
             learnings: args.learnings.clone(),
-            force: args.force,
         }),
         TaskCommand::Reopen { id } => TaskCommand::Reopen { id: id.clone() },
         TaskCommand::Cancel { id } => TaskCommand::Cancel { id: id.clone() },

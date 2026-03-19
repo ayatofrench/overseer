@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { tasks } from "./routes/tasks.js";
 import { gates } from "./routes/gates.js";
+import { watch } from "./routes/watch.js";
 
 /**
  * Create API routes without static file serving.
@@ -13,6 +14,7 @@ const api = new Hono()
   })
   .route("/api/tasks", tasks)
   .route("/api/gates", gates)
+  .route("/api/watch", watch)
   // Catch-all for undefined API routes
   .all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 

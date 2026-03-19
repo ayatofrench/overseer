@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -31,8 +32,15 @@ impl<'a> GateExecutor<'a> {
             .ok_or_else(|| OsError::TaskNotFound(task_id.clone()))?;
         let depth = task_repo::get_task_depth(self.conn, task_id)?;
 
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete", &cwd)?;
+        // Prefer workspace path for gate config discovery (.overseer/gates.json)
+        let process_cwd = std::env::current_dir().unwrap_or_default();
+        let workspace_path = task_repo::get_metadata(self.conn, task_id)
+            .ok()
+            .flatten()
+            .and_then(|meta| meta.get("workspacePath").and_then(|v| v.as_str().map(PathBuf::from)))
+            .filter(|p| p.exists());
+        let search_dir = workspace_path.as_deref().unwrap_or(&process_cwd);
+        let gates = gate_repo::resolve_gates(self.conn, task_id, depth, "complete", search_dir)?;
         let mut results = Vec::new();
 
         for gate in &gates {
@@ -155,11 +163,22 @@ impl<'a> GateExecutor<'a> {
             .unwrap_or(300);
 
         let resolved_command = self.resolve_templates(command, task_id);
+        // CWD priority: 1) explicit gate config, 2) task workspace, 3) inherited from process
         let cwd = gate
             .config
             .get("cwd")
             .and_then(|v| v.as_str())
-            .map(|c| self.resolve_templates(c, task_id));
+            .map(|c| self.resolve_templates(c, task_id))
+            .or_else(|| {
+                task_repo::get_metadata(self.conn, task_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|meta| {
+                        meta.get("workspacePath")
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    })
+                    .filter(|p| std::path::Path::new(p).exists())
+            });
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&resolved_command);
@@ -168,6 +187,13 @@ impl<'a> GateExecutor<'a> {
         cmd.env("OVERSEER_GATE_NAME", &gate.name);
         cmd.env("OVERSEER_GATE_ID", gate.id.to_string());
         cmd.env("OVERSEER_ATTEMPT", attempt.to_string());
+
+        // Expose workspace path as env var (even if not used as CWD)
+        if let Ok(Some(meta)) = task_repo::get_metadata(self.conn, task_id) {
+            if let Some(ws) = meta.get("workspacePath").and_then(|v| v.as_str()) {
+                cmd.env("OVERSEER_WORKSPACE", ws);
+            }
+        }
 
         if let Some(ref cwd_path) = cwd {
             let expanded = shellexpand::tilde(cwd_path);

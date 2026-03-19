@@ -37,6 +37,9 @@ ui-test-*.png
 # Overseer local DB
 .overseer/
 
+# Agent workspaces
+.agents/
+
 # npm publish artifacts (generated at release)
 npm/overseer-darwin-*/
 npm/overseer-linux-*/

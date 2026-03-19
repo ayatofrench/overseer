@@ -171,10 +171,6 @@ pub struct CompleteArgs {
     /// Add learnings discovered during this task (repeatable)
     #[arg(long = "learning", action = clap::ArgAction::Append)]
     pub learnings: Vec<String>,
-
-    /// Force completion even if gates are not satisfied
-    #[arg(long)]
-    pub force: bool,
 }
 
 #[derive(Args)]
@@ -403,11 +399,10 @@ pub fn handle_workflow(
         }
 
         TaskCommand::Complete(args) => Ok(TaskResult::One(
-            workflow.complete_with_learnings_force(
+            workflow.complete_with_learnings(
                 &args.id,
                 args.result.as_deref(),
                 &args.learnings,
-                args.force,
             )?,
         )),
 

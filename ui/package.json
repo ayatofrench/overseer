@@ -22,6 +22,7 @@
   "dependencies": {
     "@dagrejs/dagre": "^1.1.8",
     "@hono/node-server": "^1.19.9",
+    "@pierre/diffs": "^1.1.1",
     "@tanstack/react-query": "^5.66.0",
     "@xyflow/react": "^12.10.0",
     "better-result": "^2.7.0",

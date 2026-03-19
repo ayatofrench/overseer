@@ -81,6 +81,15 @@ impl<'a> TaskWorkflowService<'a> {
                 if let Some(ref bookmark) = task.bookmark {
                     self.vcs.checkout(bookmark)?;
                 }
+            } else if let Some(ws_path) = workspace_path {
+                // Persist workspacePath in case a previous start didn't store it
+                let abs_path = std::path::Path::new(ws_path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(ws_path));
+                let mut meta = task_repo::get_metadata(self.conn, id)?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                meta["workspacePath"] = serde_json::json!(abs_path.to_string_lossy());
+                task_repo::set_metadata(self.conn, id, &meta)?;
             }
             return self.task_service.get(id);
         }
@@ -103,6 +112,15 @@ impl<'a> TaskWorkflowService<'a> {
             // DB updates
             task_repo::set_bookmark(self.conn, id, &bookmark)?;
             task_repo::set_start_commit(self.conn, id, &sha)?;
+
+            // Store absolute workspace path in metadata for gate CWD resolution
+            let abs_path = std::path::Path::new(ws_path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(ws_path));
+            let mut meta = task_repo::get_metadata(self.conn, id)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            meta["workspacePath"] = serde_json::json!(abs_path.to_string_lossy());
+            task_repo::set_metadata(self.conn, id, &meta)?;
         } else {
             // Classic mode: bookmark + checkout in current working copy
             // 1. Ensure bookmark exists (idempotent)
@@ -120,6 +138,24 @@ impl<'a> TaskWorkflowService<'a> {
             // 4. DB updates (after VCS succeeds)
             task_repo::set_bookmark(self.conn, id, &bookmark)?;
             task_repo::set_start_commit(self.conn, id, &sha)?;
+        }
+
+        // Inherit workspace from parent if subtask has no explicit workspace
+        if workspace_path.is_none() {
+            if let Some(ref parent_id) = task.parent_id {
+                if let Ok(Some(parent_meta)) = task_repo::get_metadata(self.conn, parent_id) {
+                    if let Some(ws) = parent_meta.get("workspacePath").and_then(|v| v.as_str()) {
+                        if std::path::Path::new(ws).exists() {
+                            let mut meta = task_repo::get_metadata(self.conn, id)?
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            if meta.get("workspacePath").is_none() {
+                                meta["workspacePath"] = serde_json::json!(ws);
+                                task_repo::set_metadata(self.conn, id, &meta)?;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if task.started_at.is_none() {
@@ -255,16 +291,6 @@ impl<'a> TaskWorkflowService<'a> {
         learnings: &[String],
     ) -> Result<Task> {
         self.complete_with_learnings_opt(id, result, learnings, false)
-    }
-
-    pub fn complete_with_learnings_force(
-        &self,
-        id: &TaskId,
-        result: Option<&str>,
-        learnings: &[String],
-        force: bool,
-    ) -> Result<Task> {
-        self.complete_with_learnings_opt(id, result, learnings, force)
     }
 
     fn complete_with_learnings_opt(
